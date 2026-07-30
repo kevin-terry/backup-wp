@@ -1,0 +1,87 @@
+# CLAUDE.md
+
+Guidance for working on this repository.
+
+## What this is
+
+A single bash script that pulls a WordPress site's database and uploads down
+from production over SSH. `backup-wp` at the repo root is the whole program;
+everything else is tests, docs and packaging.
+
+```bash
+make test     # offline suite: stubs ssh and rsync, no network, no server
+make lint     # shellcheck
+make install  # symlink into ~/.local/bin (so a git pull updates the tool)
+```
+
+## Invariants
+
+Break any of these and the tool stops being trustworthy:
+
+- **Nothing is ever written to the server.** The database streams out of
+  `wp-cli` and the uploads come down over rsync. No temp files, no archives
+  built remotely, no cleanup to forget.
+- **No site names, hostnames or docroot names in the code.** Sites are resolved
+  from the directory you're standing in; connection details are discovered by
+  asking the server and cached per site in `~/.config/backup-wp/<site>.conf`.
+  Docroots are recognised by their marker files (`wp-cli.yml`, `wp-config.php`,
+  `wp-load.php`), never by name — `public_html`, `httpdocs`, `htdocs` and `web`
+  all have to work untouched.
+- **Retention is bounded by depth, not just by filename.** Only files at exactly
+  `<backup root>/<year>/<month>/<site>/` are eligible for trimming, so anything
+  a user files elsewhere under the backup root is untouchable even when the name
+  matches. Widening that search is a data-loss bug.
+- **Guessing is always announced.** Where a path can't be derived, the script
+  says it guessed and names the setting to correct.
+
+## Constraints worth knowing
+
+**Target bash 3.2.** That's what macOS ships as `/bin/bash`, and `#!/usr/bin/env
+bash` finds it. No associative arrays, no `${var^^}`, no `mapfile`. Empty-array
+expansion under `set -u` needs the `${arr[*]-}` form.
+
+**`set -euo pipefail` is on.** Two traps this repeatedly sets:
+
+- A bare `[ cond ] && cmd` as the last statement in a function, loop body or
+  `if` branch aborts the script when the condition is false. Use a full `if`.
+- `cmd | head -1` can SIGPIPE the producer, and under `pipefail` the pipeline
+  then reports failure even though it succeeded. Capture into a variable
+  instead of piping when the exit status matters.
+
+**The remote probe is a heredoc.** `probe_remote` ships a script to the server
+over `ssh bash -s`. It never executes locally, so the test suite extracts it by
+the `REMOTE` heredoc marker and runs it against synthetic trees. Renaming that
+marker silently decouples the tests — one assertion checks the extraction is
+non-empty precisely to catch that.
+
+**wp-cli only searches upward** from its working directory for `wp-load.php`.
+That's why discovery looks for `wp-load.php` in its own right and why every
+candidate is proved by actually running `wp` there rather than by inspecting
+paths.
+
+## Testing
+
+The suite is hermetic: a temp directory outside the repo (the script derives
+site names from the git top level, so a nested temp dir would resolve to this
+repo), stubbed `ssh`/`rsync`/`wp`, and a backup root with a space in the name to
+catch quoting bugs.
+
+A `VAR=x run ...` prefix on a *shell function* persists after the call in bash,
+unlike on an external command. `run()` clears its overrides for that reason —
+without it, one test silently reconfigures the next.
+
+When fixing a bug, verify the new test fails against the old code. Several
+tests here were written that way and it's the only thing that proves them.
+
+## Style
+
+shellcheck runs at `-S warning` in CI; the code is currently clean at `-S style`
+too. Suppressions must carry a comment saying why the warning is wrong — there
+are three, all genuine false positives.
+
+## Publishing
+
+This repo is public. Nothing in the code, comments, docs or test fixtures should
+name a real host, account, domain or site, or use a path convention specific to
+one hosting provider. Placeholders are `example-site`, `example-prod`,
+`example.com` and `/home/user/...`.
