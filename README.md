@@ -15,27 +15,14 @@ second run only moves what changed.
 
 ## Why
 
-The usual update routine for a self-managed WordPress site looks like this:
+To help streamline a specific regular maintenance workflow. I prefer to avoid installing
+bulky over complicated plugins so this is what I came up with. It works well for me.
+It might work for you too.
 
-1. Update dependencies locally, test, commit, deploy.
-2. Log into the host's control panel, export the database, download it.
-3. Log back in, archive the uploads folder, download it, delete the archive.
-4. Export the database again once everything is updated.
+This should work well on most hosting servers if you have ssh access and `wp-cli` installed.
+I haven't tested this on managed WordPress hosts like WP Engine.
 
-Steps 2–4 are clicking, waiting, and remembering. This replaces them with two
-commands you can run without leaving your project directory.
-
-## Fair warning
-
-I built this for my own setup — a handful of WordPress sites I maintain and got
-tired of backing up by hand. It works well for me. It might work for you.
-
-It should work on most shared hosting and VPS servers that have `wp-cli`
-installed. I haven't tested it on managed WordPress hosts like WP Engine, which
-tend to wrap SSH in their own tooling.
-
-Read the script before pointing it at anything you care about — it's short on
-purpose. Reports from other hosts are welcome, but treat this as "here, try it"
+Reports from other hosts are welcome, but treat this as "here, try it"
 rather than something I'll be supporting.
 
 ## Requirements
@@ -164,7 +151,7 @@ Worth reading once, since this is the only part that removes anything.
 **The uploads mirror is exact, but nothing is destroyed.** It runs
 `rsync --delete`, so a file that exists locally but not on production is taken
 out of the mirror — that's what makes it a faithful copy. Before that happens,
-anything about to be deleted *or overwritten* is moved into a dated folder
+anything about to be deleted _or overwritten_ is moved into a dated folder
 beside that run's archives:
 
 ```text
