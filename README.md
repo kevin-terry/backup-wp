@@ -86,10 +86,15 @@ $ backup-wp pre
 ==> Saved ~/.config/backup-wp/example-site.conf
 ```
 
-It finds WordPress by locating `wp-cli.yml` / `wp-config.php` under the remote
-`$HOME`, confirms each candidate with `wp core version`, and asks WordPress
-itself where uploads live (`wp_upload_dir()`) rather than guessing. If exactly
-one install checks out, it doesn't even ask.
+It finds WordPress by locating `wp-cli.yml`, `wp-config.php` or `wp-load.php`
+under the remote `$HOME`, confirms each candidate by actually running
+`wp core version` there, and asks WordPress itself where uploads live
+(`wp_upload_dir()`) rather than guessing. If exactly one install checks out, it
+doesn't even ask.
+
+No particular one of those files has to exist. `wp-load.php` is in the list so
+the WordPress root is found directly, which matters when `wp-config.php` has
+been moved a level above it.
 
 The answers are saved per site, so it never asks twice. To skip the question
 entirely — handy for scripting — pass the alias:
@@ -216,9 +221,10 @@ Nothing here has a list of docroot names in it. `public_html`, `httpdocs`,
 `htdocs`, `web`, `public` — all work without configuration, because both sides
 are worked out by structure:
 
-- **Remote:** WordPress is found by locating `wp-cli.yml` / `wp-config.php`, and
-  the uploads path comes from WordPress itself via `wp_upload_dir()`. Whatever
-  your host calls its folders is irrelevant.
+- **Remote:** WordPress is found by its marker files — `wp-cli.yml`,
+  `wp-config.php` or `wp-load.php`, any one will do — and the uploads path comes
+  from WordPress itself via `wp_upload_dir()`. Whatever your host calls its
+  folders is irrelevant.
 - **Local:** the mirror path is derived from where the uploads sit _relative to_
   the remote project root, then applied to your project. A docroot called
   `httpdocs` lands at `httpdocs/...` locally without anything being named.

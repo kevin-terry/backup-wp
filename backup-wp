@@ -213,14 +213,23 @@ for c in "$(command -v wp 2>/dev/null || true)" "$HOME/bin/wp" \
 done
 [ -n "$wp" ] || { echo "NOWP"; exit 0; }
 
-# Candidate roots: anywhere a wp-cli.yml or a wp-config.php lives. When both
-# turn up, wp-cli.yml wins — that is the dir wp-cli expects to be run from.
+# Candidate roots: anywhere a wp-cli.yml, wp-config.php or wp-load.php lives.
+# Each is then proved by actually running wp there, so a false candidate costs
+# nothing and no single marker has to be present.
+#
+# wp-load.php matters on its own because wp-cli only ever searches upward from
+# the current directory. WordPress permits wp-config.php to sit one level ABOVE
+# its root, and that layout is widely recommended for hardening — searching for
+# wp-config.php alone would land on a directory wp can do nothing with, while
+# the real root just below it went unexamined. wp-load.php is always in the
+# root, so it points at the one directory wp-cli can actually be run from.
 #
 # Resolve $HOME first and search with -L: on some shared hosts $HOME is itself
 # a symlink pointing into a shared container path, and find will not descend
 # through a symlinked starting point, so the plain form silently finds nothing.
 root="$(cd "$HOME" 2>/dev/null && pwd -P)" || root="$HOME"
-find -L "$root" -maxdepth 5 \( -name wp-cli.yml -o -name wp-config.php \) \
+find -L "$root" -maxdepth 5 \
+     \( -name wp-cli.yml -o -name wp-config.php -o -name wp-load.php \) \
      -not -path '*/vendor/*' -not -path '*/node_modules/*' \
      2>/dev/null | while read -r f; do dirname "$f"; done | sort -u |
 while read -r dir; do

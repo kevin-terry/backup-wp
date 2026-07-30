@@ -33,9 +33,11 @@ assert_eq()      { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1', wan
 # ── hermetic environment ────────────────────────────────────────────────────
 # Deliberately outside the repo: the script derives the site name from the git
 # top level, so a temp dir nested here would resolve to this repo's name.
-# cd/pwd normalises the path: macOS $TMPDIR carries a trailing slash, which
-# would otherwise leave a doubled separator that the script quietly collapses.
-TMP="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/backup-wp-test.XXXXXX")" && pwd)"
+# pwd -P normalises twice over: macOS $TMPDIR carries a trailing slash that
+# would leave a doubled separator, and /var is itself a symlink to /private/var,
+# which the script resolves when it inspects $HOME. Start physical so every
+# path we compare against matches what the script computes.
+TMP="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/backup-wp-test.XXXXXX")" && pwd -P)"
 trap 'rm -rf "$TMP"' EXIT
 
 SITE=example-site
@@ -204,6 +206,86 @@ assert_has "LOCAL_UPLOADS" "...and names the setting to correct"
 assert_eq "$(grep '^LOCAL_UPLOADS=' "$CONFIG/backup-wp/detached-site.conf" | cut -d'"' -f2)" \
           "$DET/web/app/uploads" \
           "finds an existing uploads dir whatever it is nested under"
+
+# ── the probe that runs on the server ───────────────────────────────────────
+group "remote discovery"
+
+# The probe is a heredoc inside backup-wp that normally executes over ssh.
+# Extract it and run it here against synthetic trees, with a wp stub that
+# reproduces the one behaviour that decides everything: wp-cli only ever
+# searches UPWARD for wp-load.php, optionally redirected by a wp-cli.yml path.
+PROBE="$TMP/probe.sh"
+awk '/<<.REMOTE./{f=1;next} /^REMOTE$/{f=0} f' "$SCRIPT" > "$PROBE"
+if [ -s "$PROBE" ]; then
+    ok "extracted the remote probe from the script"
+else
+    bad "extracted the remote probe from the script (heredoc marker changed?)"
+fi
+
+cat > "$STUB/wp" <<'EOS'
+#!/usr/bin/env bash
+resolve_root() {
+    local d="$PWD" p
+    while :; do
+        if [ -f "$d/wp-cli.yml" ]; then
+            p="$(sed -n 's/^path:[[:space:]]*//p' "$d/wp-cli.yml" | head -1)"
+            if [ -n "$p" ] && [ -e "$d/$p/wp-load.php" ]; then echo "$d/$p"; return 0; fi
+        fi
+        if [ -e "$d/wp-load.php" ]; then echo "$d"; return 0; fi
+        if [ "$d" = "/" ]; then return 1; fi
+        d="$(dirname "$d")"
+    done
+}
+root="$(resolve_root)" || {
+    echo "Error: This does not seem to be a WordPress installation." >&2; exit 1; }
+case "${1:-}" in
+    core) echo "6.9.4" ;;
+    eval) echo "$root/wp-content/uploads" ;;
+    *)    exit 1 ;;
+esac
+EOS
+chmod +x "$STUB/wp"
+
+HOMES="$TMP/homes"
+# A: ordinary install, no wp-cli.yml anywhere
+mkdir -p "$HOMES/a/public_html/wp-content/uploads"
+: > "$HOMES/a/public_html/wp-config.php"; : > "$HOMES/a/public_html/wp-load.php"
+# B: wp-config.php moved one level ABOVE the WordPress root (WordPress supports
+#    this and it is widely recommended; searching for wp-config.php alone lands
+#    on a directory wp-cli can do nothing with)
+mkdir -p "$HOMES/b/public_html/wp-content/uploads"
+: > "$HOMES/b/wp-config.php"; : > "$HOMES/b/public_html/wp-load.php"
+# C: project root with wp-cli.yml pointing at core nested below the docroot
+mkdir -p "$HOMES/c/public_html/wordpress/wp-content/uploads"
+printf 'path: public_html/wordpress\n' > "$HOMES/c/wp-cli.yml"
+: > "$HOMES/c/public_html/wp-config.php"; : > "$HOMES/c/public_html/wordpress/wp-load.php"
+
+probe()      { OUT="$(HOME="$1" PATH="$STUB:$PATH" bash "$PROBE" 2>&1)"; }
+probe_dirs() { printf '%s\n' "$OUT" | awk -F'\t' '/^OK/{print $3}'; }
+probe_has()  { probe_dirs | grep -qx "$1"; }
+
+probe "$HOMES/a"
+assert_eq "$(probe_dirs)" "$HOMES/a/public_html" \
+          "finds a plain install with no wp-cli.yml"
+
+probe "$HOMES/b"
+if probe_has "$HOMES/b/public_html"; then
+    ok "finds the root when wp-config.php sits above it"
+else
+    bad "finds the root when wp-config.php sits above it (got: $(probe_dirs | tr '\n' ' '))"
+fi
+
+probe "$HOMES/c"
+if probe_has "$HOMES/c"; then
+    ok "offers the project root when wp-cli.yml points at nested core"
+else
+    bad "offers the project root when wp-cli.yml points at nested core"
+fi
+
+# A directory with no WordPress in it must yield nothing at all.
+mkdir -p "$HOMES/empty/notes"
+probe "$HOMES/empty"
+assert_eq "$(probe_dirs)" "" "reports nothing when there is no WordPress"
 
 # ── database ────────────────────────────────────────────────────────────────
 group "database"
