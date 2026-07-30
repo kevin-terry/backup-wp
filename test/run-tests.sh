@@ -81,14 +81,21 @@ esac
 # wp-cli calls arrive as one remote command string
 case "$last" in
     *"plugin list"*)
-        echo "name,version,update,update_version"
-        echo "in-composer,1.0,available,1.1"
-        echo "server-only,2.0,available,2.5"
-        echo "up-to-date,3.0,none,"
+        echo "name,status,version,update,update_version"
+        echo "in-composer,active,1.0,available,1.1"
+        echo "server-only,active,2.0,available,2.5"
+        echo "up-to-date,active,3.0,none,"
+        # premium-thing is deliberately absent from the transient below: its
+        # updater never registers, so "none" here means "nobody asked"
+        echo "premium-thing,active,5.0,none,"
+        echo "mu-plugins,must-use,1.0,none,"
         exit 0 ;;
     *"plugin update"*)
         echo "Plugin updated successfully."
         echo "${last##* }" >> "$STUB_UPDATE_LOG"
+        exit 0 ;;
+    *eval*)   # which plugins the update transient has actually heard from
+        printf '%s\n' in-composer server-only up-to-date
         exit 0 ;;
 esac
 {
@@ -432,9 +439,24 @@ assert_has "--update"    "says how to apply them"
 assert_eq "$(wc -l < "$TMP/updated.log" | tr -d ' ')" "0" \
           "listing updates nothing"
 case "$OUT" in
-    *up-to-date*) bad "hides plugins with no update pending" ;;
-    *)            ok  "hides plugins with no update pending" ;;
+    *up-to-date*) bad "hides plugins that are genuinely current" ;;
+    *)            ok  "hides plugins that are genuinely current" ;;
 esac
+
+# A plugin whose updater never registers reports "none", which looks identical
+# to being current. It must be called out rather than silently counted as fine.
+assert_has "premium-thing" "names a plugin the update system never heard from"
+assert_has "no updater"    "...labelled so it cannot be mistaken for current"
+assert_has "never heard from" "...and explains what that means"
+case "$OUT" in
+    *mu-plugins*) bad "ignores the must-use pseudo-entry" ;;
+    *)            ok  "ignores the must-use pseudo-entry" ;;
+esac
+
+: > "$TMP/updated.log"
+run plugins --update
+assert_eq "$(cat "$TMP/updated.log")" "server-only" \
+          "--update leaves the silent plugin alone (it has no update to fetch)"
 
 : > "$TMP/updated.log"
 run plugins --update -n

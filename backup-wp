@@ -537,16 +537,40 @@ if [ "$DO_PLUGINS" -eq 1 ]; then
 
     # No --skip-plugins here: premium plugins register their own update checks,
     # so skipping them hides exactly the updates this command exists to find.
-    listing="$(remote_wp plugin list --fields=name,version,update,update_version \
+    listing="$(remote_wp plugin list --fields=name,status,version,update,update_version \
                                      --format=csv)" \
         || die "could not list plugins on $SSH_HOST"
 
-    owned="$(composer_owned)"
-    updatable=""; theirs=0
+    # `wp plugin list` reports "none" for two very different situations: the
+    # plugin is current, or nothing ever asked about it. Premium plugins hook
+    # their update checks on admin-only actions and wp-cli never loads admin
+    # context, so they are simply absent from the update data — and "none"
+    # then reads as reassurance it has not earned. Ask which plugins WordPress
+    # has actually heard from, so the silent ones can be named instead.
+    # shellcheck disable=SC2016  # PHP, not shell — it must not expand here
+    known="$(remote_wp eval '
+$t = get_site_transient("update_plugins");
+if (!$t) { exit; }
+$r = isset($t->response)  ? (array) $t->response  : array();
+$n = isset($t->no_update) ? (array) $t->no_update : array();
+foreach (array_merge(array_keys($r), array_keys($n)) as $f) { echo dirname($f), "\n"; }
+' 2>/dev/null)" || known=""
 
-    while IFS=, read -r name version update next; do
+    owned="$(composer_owned)"
+    updatable=""; theirs=0; silent=""
+
+    while IFS=, read -r name status version update next; do
         if [ "$name" = "name" ] || [ -z "$name" ]; then continue; fi
-        if [ "$update" != "available" ]; then continue; fi
+        # must-use and drop-ins are not installed plugins and never update
+        case "$status" in must-use|dropin) continue ;; esac
+        if [ "$update" != "available" ]; then
+            # Server-managed and never heard from: a human has to go and look.
+            if ! printf '%s\n' "$owned" | grep -qx "$name" \
+               && ! printf '%s\n' "$known" | grep -qx "$name"; then
+                silent="$silent $name:$version"
+            fi
+            continue
+        fi
         if printf '%s\n' "$owned" | grep -qx "$name"; then
             printf '    %-26s %-9s → %-9s %scomposer%s\n' \
                 "$name" "$version" "$next" "$DIM" "$RST"
@@ -560,9 +584,22 @@ if [ "$DO_PLUGINS" -eq 1 ]; then
 $listing
 EOF
 
+    if [ -n "$silent" ]; then
+        for s in $silent; do
+            printf '    %-26s %-9s %-11s %sno updater%s\n' \
+                "${s%%:*}" "${s##*:}" "" "$YEL" "$RST"
+        done
+    fi
+
     if [ "$theirs" -gt 0 ]; then
         info "composer ones belong to \`composer update\` locally, then deploy —"
         info "updating them here is undone by the next deploy"
+    fi
+
+    if [ -n "$silent" ]; then
+        info "\"no updater\" means WordPress has never heard from that plugin, not"
+        info "that it is current — premium updaters do not register under wp-cli."
+        info "Check those by hand; --update cannot see an update for them either."
     fi
 
     if [ -z "$updatable" ]; then

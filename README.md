@@ -208,9 +208,13 @@ backup-wp plugins --update   # apply the ones the server owns
 $ backup-wp plugins
 ==> Plugins
     contact-form              1.2.0     → 1.3.1     composer
-    some-premium-plugin       6.32      → 6.34      server
+    file-manager              6.2.6     → 6.3.7     server
+    some-premium-plugin       6.32                  no updater
     composer ones belong to `composer update` locally, then deploy —
     updating them here is undone by the next deploy
+    "no updater" means WordPress has never heard from that plugin, not
+    that it is current — premium updaters do not register under wp-cli.
+    Check those by hand; --update cannot see an update for them either.
     run with --update to update the server-managed one(s)
 ```
 
@@ -223,13 +227,23 @@ nothing is Composer-managed and everything is fair game.
 
 **This works even when the admin can't.** `DISALLOW_FILE_MODS` is enforced in
 `map_meta_cap()`, which rewrites `update_plugins` to `do_not_allow` — a
-*capability* check, binding only on code that asks whether the current user may
+_capability_ check, binding only on code that asks whether the current user may
 act. That is the admin UI. wp-cli runs with no user and never asks. So a site
 deliberately locked down so its editors cannot install or update anything is
 still updatable by you over SSH, with no config change.
 
 The corollary is worth stating: that lockdown does not protect you from
 yourself. wp-cli ignores it for `plugin delete` too.
+
+**"no updater" is not "up to date".** `wp plugin list` reports `none` both for a
+plugin that is current and for one nothing ever asked about. Premium plugins
+usually register their update checks on admin-only hooks, and wp-cli never loads
+admin context, so they are absent from WordPress's update data entirely — and
+`none` then reads as reassurance it has not earned. This command asks WordPress
+which plugins it has actually heard from and labels the rest `no updater`, so a
+licensed plugin quietly sitting three versions behind gets named instead of
+blending in. Those still need checking by hand; `--update` can't fetch an update
+nobody reported.
 
 Back up first — `backup-wp pre` — and it's a normal `wp plugin update` behind
 the scenes, so anything it can't do, wp-cli couldn't either.
