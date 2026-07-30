@@ -21,8 +21,14 @@ Break any of these and the tool stops being trustworthy:
 - **The backup commands never write to the server.** The database streams out
   of `wp-cli` and the uploads come down over rsync. No temp files, no archives
   built remotely, no cleanup to forget. `plugins --update` is the one command
-  that writes, it is never the default, and it must stay the only one — if a
-  second exception seems necessary, that is the moment to split the tool.
+  that changes anything, it is never the default, and it must stay the only one
+  — if a second exception seems necessary, that is the moment to split the tool.
+
+  Be precise about `plugins` without `--update`: it changes nothing, but asking
+  WordPress about updates makes WordPress refresh its cached `update_plugins`
+  transient, which is a database write. Every admin page load does the same and
+  WordPress redoes it twice a day regardless. Say "changes nothing" rather than
+  "writes nothing", and do not let that precedent grow.
 - **No site names, hostnames or docroot names in the code.** Sites are resolved
   from the directory you're standing in; connection details are discovered by
   asking the server and cached per site in `~/.config/backup-wp/<site>.conf`.

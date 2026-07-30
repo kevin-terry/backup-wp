@@ -81,13 +81,24 @@ esac
 # wp-cli calls arrive as one remote command string
 case "$last" in
     *"plugin list"*)
+        # premium-thing models a licensed plugin: it only reports an update
+        # when the checker registers, which needs admin context.
+        case "$last" in
+            *WP_ADMIN*)
+                echo admin >> "$STUB_CTX_LOG"
+                if [ -n "${STUB_ADMIN_FAILS:-}" ]; then
+                    echo "PHP Fatal error: call to undefined function" >&2
+                    exit 1
+                fi
+                premium="premium-thing,active,5.0,available,5.1" ;;
+            *)  echo plain >> "$STUB_CTX_LOG"
+                premium="premium-thing,active,5.0,none," ;;
+        esac
         echo "name,status,version,update,update_version"
         echo "in-composer,active,1.0,available,1.1"
         echo "server-only,active,2.0,available,2.5"
         echo "up-to-date,active,3.0,none,"
-        # premium-thing is deliberately absent from the transient below: its
-        # updater never registers, so "none" here means "nobody asked"
-        echo "premium-thing,active,5.0,none,"
+        echo "$premium"
         echo "mu-plugins,must-use,1.0,none,"
         exit 0 ;;
     *"plugin update"*)
@@ -157,12 +168,14 @@ run() {   # run <args...> — sandboxed; override RUN_DIR / STUB_WP / STUB_UPLOA
         STUB_WP="${STUB_WP:-$WANT_WP}" \
         STUB_UPLOADS="${STUB_UPLOADS:-$WANT_UPLOADS}" \
         STUB_UPDATE_LOG="$TMP/updated.log" \
+        STUB_CTX_LOG="$TMP/context.log" \
+        STUB_ADMIN_FAILS="${STUB_ADMIN_FAILS:-}" \
         bash "$SCRIPT" "$@" 2>&1)"
     RC=$?
     # A `VAR=x run ...` prefix on a *function* persists after the call in bash,
     # unlike on an external command. Clear the overrides so each call is
     # independent and one test cannot silently reconfigure the next.
-    unset RUN_DIR STUB_WP STUB_UPLOADS KEEP KEEP_SQL
+    unset RUN_DIR STUB_WP STUB_UPLOADS KEEP KEEP_SQL STUB_ADMIN_FAILS
 }
 
 # read a value out of the generated config without sourcing it
@@ -443,11 +456,11 @@ case "$OUT" in
     *)            ok  "hides plugins that are genuinely current" ;;
 esac
 
-# A plugin whose updater never registers reports "none", which looks identical
-# to being current. It must be called out rather than silently counted as fine.
-assert_has "premium-thing" "names a plugin the update system never heard from"
-assert_has "no updater"    "...labelled so it cannot be mistaken for current"
-assert_has "never heard from" "...and explains what that means"
+# Licensed plugins register their update checker inside is_admin(), so the
+# listing has to run with WP_ADMIN defined or their updates stay invisible.
+assert_eq "$(head -1 "$TMP/context.log")" "admin" "asks in admin context first"
+assert_has "premium-thing" "finds a licensed plugin's update"
+assert_has "5.1"           "...with the version it would move to"
 case "$OUT" in
     *mu-plugins*) bad "ignores the must-use pseudo-entry" ;;
     *)            ok  "ignores the must-use pseudo-entry" ;;
@@ -455,8 +468,18 @@ esac
 
 : > "$TMP/updated.log"
 run plugins --update
-assert_eq "$(cat "$TMP/updated.log")" "server-only" \
-          "--update leaves the silent plugin alone (it has no update to fetch)"
+assert_eq "$(sort "$TMP/updated.log" | tr '\n' ' ')" "premium-thing server-only " \
+          "--update covers the licensed plugin too"
+
+# If admin context cannot be loaded, fall back rather than fail — and say so,
+# because the fallback is exactly the case that hides licensed updates.
+: > "$TMP/context.log"
+STUB_ADMIN_FAILS=1 run plugins
+assert_rc 0 "survives admin context failing"
+assert_eq "$(sort -u "$TMP/context.log" | tr '\n' ' ')" "admin plain " \
+          "...by retrying without it"
+assert_has "could not load admin context" "...and warns that updates may be hidden"
+assert_has "no updater" "...marking the licensed plugin as unreported"
 
 : > "$TMP/updated.log"
 run plugins --update -n
@@ -468,15 +491,15 @@ assert_eq "$(wc -l < "$TMP/updated.log" | tr -d ' ')" "0" \
 : > "$TMP/updated.log"
 run plugins --update
 assert_rc 0 "plugins --update succeeds"
-assert_eq "$(cat "$TMP/updated.log")" "server-only" \
-          "updates only the plugin Composer does not own"
+assert_eq "$(sort "$TMP/updated.log" | tr '\n' ' ')" "premium-thing server-only " \
+          "updates only the plugins Composer does not own"
 
 # With no composer.json, nothing is Composer's and everything is fair game
 mv "$SITE_DIR/composer.json" "$TMP/composer.json.bak"
 : > "$TMP/updated.log"
 run plugins --update
 assert_rc 0 "works on a site with no composer.json"
-assert_eq "$(sort "$TMP/updated.log" | tr '\n' ' ')" "in-composer server-only " \
+assert_eq "$(sort "$TMP/updated.log" | tr '\n' ' ')" "in-composer premium-thing server-only " \
           "...where every pending update is fair game"
 mv "$TMP/composer.json.bak" "$SITE_DIR/composer.json"
 

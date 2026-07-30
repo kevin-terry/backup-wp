@@ -235,15 +235,24 @@ still updatable by you over SSH, with no config change.
 The corollary is worth stating: that lockdown does not protect you from
 yourself. wp-cli ignores it for `plugin delete` too.
 
-**"no updater" is not "up to date".** `wp plugin list` reports `none` both for a
-plugin that is current and for one nothing ever asked about. Premium plugins
-usually register their update checks on admin-only hooks, and wp-cli never loads
-admin context, so they are absent from WordPress's update data entirely — and
-`none` then reads as reassurance it has not earned. This command asks WordPress
-which plugins it has actually heard from and labels the rest `no updater`, so a
-licensed plugin quietly sitting three versions behind gets named instead of
-blending in. Those still need checking by hand; `--update` can't fetch an update
-nobody reported.
+**Licensed plugins need admin context to report at all.** Premium plugins
+routinely register their update checker inside `if ( is_admin() )`, and wp-cli
+is not admin context — so `wp plugin list` reports `none` for them no matter how
+current the licence is, and a plugin sitting several versions behind looks
+identical to one that is up to date. This command runs the listing with
+`WP_ADMIN` defined so those checkers register and answer. If that fails — a
+plugin can assume `wp-admin/includes` is loaded whenever `is_admin()` is true —
+it falls back to a plain listing and says so, because the fallback is exactly
+the case that hides licensed updates.
+
+Anything still unreported afterwards is labelled `no updater`, meaning
+WordPress has never heard from it rather than that it is current. Those need
+checking by hand; `--update` can't fetch an update nobody reported.
+
+One consequence worth naming: asking WordPress about updates makes WordPress
+refresh its cached `update_plugins` transient, which is a database write. Every
+admin page load does the same and WordPress redoes it twice a day anyway, so
+`plugins` changes nothing — but it isn't strictly read-only either.
 
 Back up first — `backup-wp pre` — and it's a normal `wp plugin update` behind
 the scenes, so anything it can't do, wp-cli couldn't either.

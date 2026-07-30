@@ -537,9 +537,25 @@ if [ "$DO_PLUGINS" -eq 1 ]; then
 
     # No --skip-plugins here: premium plugins register their own update checks,
     # so skipping them hides exactly the updates this command exists to find.
-    listing="$(remote_wp plugin list --fields=name,status,version,update,update_version \
-                                     --format=csv)" \
-        || die "could not list plugins on $SSH_HOST"
+    #
+    # Nor is loading them enough. Licensed plugins routinely register their
+    # update checker inside `if ( is_admin() )`, and wp-cli is not admin
+    # context — so a perfectly licensed plugin reports "none" forever. Defining
+    # WP_ADMIN makes those checkers register and answer. It is not free: a
+    # plugin may assume wp-admin/includes is loaded whenever is_admin() is true
+    # and fatal without it, so fall back to a plain listing if it misbehaves.
+    admin_ctx=1
+    listing="$(remote_wp --exec="define('WP_ADMIN', true);" \
+                 plugin list --fields=name,status,version,update,update_version \
+                             --format=csv 2>/dev/null)" || listing=""
+    case "$listing" in
+        name,*) ;;
+        *)  admin_ctx=0
+            listing="$(remote_wp plugin list \
+                         --fields=name,status,version,update,update_version \
+                         --format=csv)" \
+                || die "could not list plugins on $SSH_HOST" ;;
+    esac
 
     # `wp plugin list` reports "none" for two very different situations: the
     # plugin is current, or nothing ever asked about it. Premium plugins hook
@@ -598,8 +614,12 @@ EOF
 
     if [ -n "$silent" ]; then
         info "\"no updater\" means WordPress has never heard from that plugin, not"
-        info "that it is current — premium updaters do not register under wp-cli."
-        info "Check those by hand; --update cannot see an update for them either."
+        info "that it is current. Check those by hand; --update cannot fetch an"
+        info "update nobody reported."
+    fi
+    if [ "$admin_ctx" -eq 0 ]; then
+        warn "could not load admin context, so licensed plugins that register"
+        warn "their update checks there may be missing from this list"
     fi
 
     if [ -z "$updatable" ]; then
