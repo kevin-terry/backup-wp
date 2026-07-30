@@ -13,8 +13,9 @@
 # server itself, and remembers all of it in ~/.config/backup-wp/<site>.conf.
 # There is no site list to maintain in this file.
 #
-# Nothing is ever written to the server: the database streams out of wp-cli and
-# the uploads come down as an rsync delta transfer.
+# The backup commands never write to the server: the database streams out of
+# wp-cli and the uploads come down as an rsync delta transfer. `plugins
+# --update` is the single exception, and it says so before it does anything.
 #
 # Requires: rsync, zstd, and an SSH alias per site in ~/.ssh/config.
 
@@ -60,6 +61,7 @@ what
   db         database only, untagged
   uploads    uploads mirror only
   all        database + uploads                 (the default)
+  plugins    list pending plugin updates; --update applies them
 
 options
   -a, --archive     also build a dated .tar.zst of the uploads
@@ -67,6 +69,7 @@ options
   -f, --force       skip the first-run confirmation before an rsync --delete
       --no-prune    keep every old snapshot instead of trimming to $KEEP
       --no-rescue   delete outright instead of moving replaced files aside
+      --update      with `plugins`, actually apply the updates
       --setup       (re)run discovery for this site and rewrite its config
       --host <a>    set up against ssh alias <a> without asking (implies --setup)
       --list        list configured sites and exit
@@ -87,11 +90,11 @@ EOF
 
 # ── argument parsing ────────────────────────────────────────────────────────
 SITE=""; WHAT=""; ARCHIVE=0; DRY=0; FORCE=0; PRUNE=1; SETUP=0; HOST_ARG=""
-RESCUE_ON=1
+RESCUE_ON=1; APPLY=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        pre|post|db|uploads|all)
+        pre|post|db|uploads|all|plugins)
             [ -z "$WHAT" ] || die "more than one action given: $WHAT and $1"
             WHAT="$1" ;;
         -a|--archive)  ARCHIVE=1 ;;
@@ -99,6 +102,7 @@ while [ $# -gt 0 ]; do
         -f|--force)    FORCE=1 ;;
         --no-prune)    PRUNE=0 ;;
         --no-rescue)   RESCUE_ON=0 ;;
+        --update)      APPLY=1 ;;
         --setup)       SETUP=1 ;;
         --host)        shift; [ $# -gt 0 ] || die "--host needs an ssh alias"
                        HOST_ARG="$1"; SETUP=1 ;;
@@ -126,12 +130,14 @@ while [ $# -gt 0 ]; do
 done
 
 WHAT="${WHAT:-all}"
+DO_PLUGINS=0
 case "$WHAT" in
     pre)     DO_DB=1; DO_UP=0; LABEL="pre"  ;;
     post)    DO_DB=1; DO_UP=1; LABEL="post" ;;
     db)      DO_DB=1; DO_UP=0; LABEL=""     ;;
     uploads) DO_DB=0; DO_UP=1; LABEL=""     ;;
     all)     DO_DB=1; DO_UP=1; LABEL=""     ;;
+    plugins) DO_DB=0; DO_UP=0; LABEL=""; DO_PLUGINS=1 ;;
 esac
 
 # ── which site? ─────────────────────────────────────────────────────────────
@@ -498,7 +504,84 @@ if [ "$DO_UP" -eq 1 ]; then
     fi
 fi
 
-# ── 3. prune ────────────────────────────────────────────────────────────────
+# ── 3. plugins ──────────────────────────────────────────────────────────────
+# The one command in this script that writes to the server.
+#
+# wp-cli is not subject to DISALLOW_FILE_MODS. That constant is enforced in
+# map_meta_cap(), which rewrites update_plugins to do_not_allow — a *capability*
+# check, so it only binds code that asks "may the current user do this?". That
+# is the admin UI. wp-cli runs with no user and never asks, so a site locked
+# down for its editors is still updatable over ssh.
+remote_wp() {
+    local a args=""
+    for a in "$@"; do args="$args $(printf %q "$a")"; done
+    # printf %q expands here, on purpose, to build a safely quoted remote command
+    # shellcheck disable=SC2029
+    ssh "${SSH_OPTS[@]}" "$SSH_HOST" \
+        "cd $(printf %q "$REMOTE_WP") && $(printf %q "$REMOTE_WP_BIN")$args"
+}
+
+# Plugin slugs Composer owns, taken from the project's composer.json: the half
+# of "vendor/name" after the slash is the directory Composer installs into.
+# No composer.json means nothing is Composer-managed, which is the right answer
+# for a site that is not built that way.
+composer_owned() {
+    [ -r "$SITE_DIR/composer.json" ] || return 0
+    grep -oE '"[A-Za-z0-9_.:-]+/[A-Za-z0-9_.-]+"[[:space:]]*:' "$SITE_DIR/composer.json" \
+        | sed 's/^"//; s/"[[:space:]]*:$//' \
+        | awk -F/ '{print $2}' | sort -u
+}
+
+if [ "$DO_PLUGINS" -eq 1 ]; then
+    step "Plugins"
+
+    # No --skip-plugins here: premium plugins register their own update checks,
+    # so skipping them hides exactly the updates this command exists to find.
+    listing="$(remote_wp plugin list --fields=name,version,update,update_version \
+                                     --format=csv)" \
+        || die "could not list plugins on $SSH_HOST"
+
+    owned="$(composer_owned)"
+    updatable=""; theirs=0
+
+    while IFS=, read -r name version update next; do
+        if [ "$name" = "name" ] || [ -z "$name" ]; then continue; fi
+        if [ "$update" != "available" ]; then continue; fi
+        if printf '%s\n' "$owned" | grep -qx "$name"; then
+            printf '    %-26s %-9s → %-9s %scomposer%s\n' \
+                "$name" "$version" "$next" "$DIM" "$RST"
+            theirs=$((theirs + 1))
+        else
+            printf '    %-26s %-9s → %-9s %sserver%s\n' \
+                "$name" "$version" "$next" "$B" "$RST"
+            updatable="$updatable $name"
+        fi
+    done <<EOF
+$listing
+EOF
+
+    if [ "$theirs" -gt 0 ]; then
+        info "composer ones belong to \`composer update\` locally, then deploy —"
+        info "updating them here is undone by the next deploy"
+    fi
+
+    if [ -z "$updatable" ]; then
+        info "nothing to update on the server"
+    elif [ "$APPLY" -eq 0 ]; then
+        info "run with ${B}--update${RST} to update the server-managed one(s)"
+    else
+        for p in $updatable; do
+            if [ "$DRY" -eq 1 ]; then
+                info "would update $p"
+            else
+                remote_wp plugin update "$p" 2>&1 | sed 's/^/    /' \
+                    || warn "$p did not update cleanly"
+            fi
+        done
+    fi
+fi
+
+# ── 4. prune ────────────────────────────────────────────────────────────────
 # Timestamps lead the filename, so a reverse sort is newest-first.
 #
 # The depth bounds are the safety rail: retention is confined to the exact

@@ -9,9 +9,12 @@ backup-wp pre     # database snapshot, before you deploy
 backup-wp post    # database snapshot + uploads mirror, after
 ```
 
-Nothing is ever written to the server. The database streams out of `wp-cli`
-already compressed; the uploads come down as an rsync delta transfer, so the
-second run only moves what changed.
+The backup commands never write to the server. The database streams out of
+`wp-cli` already compressed; the uploads come down as an rsync delta transfer,
+so the second run only moves what changed.
+
+There is one command that does write — `plugins --update` — and it is never the
+default.
 
 ## Why
 
@@ -98,6 +101,8 @@ backup-wp post                 # DB tagged "post" + uploads mirror
 backup-wp post --archive       # ...and a dated .tar.zst of the uploads
 backup-wp db                   # DB only, untagged
 backup-wp uploads              # uploads only
+backup-wp plugins              # list pending plugin updates
+backup-wp plugins --update     # apply the server-managed ones
 backup-wp                      # DB + uploads
 ```
 
@@ -117,6 +122,7 @@ Options:
 | `-f, --force`    | skip the first-run confirmation before `rsync --delete` |
 | `--no-prune`     | keep every old snapshot instead of trimming             |
 | `--no-rescue`    | delete outright instead of moving replaced files aside  |
+| `--update`       | with `plugins`, actually apply the updates              |
 | `--setup`        | re-run discovery and rewrite this site's config         |
 | `--host <alias>` | set up against an SSH alias without asking              |
 | `--list`         | show every configured site                              |
@@ -187,7 +193,46 @@ even if the name matches. A `manual/` folder, loose files at the root, notes,
 exports under their own names: all safe indefinitely. `--no-prune` skips
 trimming entirely.
 
-**Nothing on the server is ever created, modified, or deleted.**
+**No backup command creates, modifies or deletes anything on the server.** The
+sole exception is `plugins --update`, which is opt-in twice over: a command you
+have to name, and a flag you have to add.
+
+## Plugin updates
+
+```bash
+backup-wp plugins            # what has updates, and who owns each one
+backup-wp plugins --update   # apply the ones the server owns
+```
+
+```console
+$ backup-wp plugins
+==> Plugins
+    contact-form              1.2.0     → 1.3.1     composer
+    some-premium-plugin       6.32      → 6.34      server
+    composer ones belong to `composer update` locally, then deploy —
+    updating them here is undone by the next deploy
+    run with --update to update the server-managed one(s)
+```
+
+Ownership is read from your project's `composer.json`: the half of `vendor/name`
+after the slash is the directory Composer installs into. Updating a
+Composer-managed plugin on the server is worse than pointless — the next deploy
+reverts it, and until then production quietly disagrees with your lockfile. So
+`--update` skips them and tells you why. On a site with no `composer.json`,
+nothing is Composer-managed and everything is fair game.
+
+**This works even when the admin can't.** `DISALLOW_FILE_MODS` is enforced in
+`map_meta_cap()`, which rewrites `update_plugins` to `do_not_allow` — a
+*capability* check, binding only on code that asks whether the current user may
+act. That is the admin UI. wp-cli runs with no user and never asks. So a site
+deliberately locked down so its editors cannot install or update anything is
+still updatable by you over SSH, with no config change.
+
+The corollary is worth stating: that lockdown does not protect you from
+yourself. wp-cli ignores it for `plugin delete` too.
+
+Back up first — `backup-wp pre` — and it's a normal `wp plugin update` behind
+the scenes, so anything it can't do, wp-cli couldn't either.
 
 ## Configuration
 

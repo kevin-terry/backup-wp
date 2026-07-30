@@ -78,6 +78,19 @@ case "$last" in
         printf 'OK\t/usr/local/bin/wp\t%s/public_html\t%s\n' "$STUB_WP" "$STUB_UPLOADS"
         exit 0 ;;
 esac
+# wp-cli calls arrive as one remote command string
+case "$last" in
+    *"plugin list"*)
+        echo "name,version,update,update_version"
+        echo "in-composer,1.0,available,1.1"
+        echo "server-only,2.0,available,2.5"
+        echo "up-to-date,3.0,none,"
+        exit 0 ;;
+    *"plugin update"*)
+        echo "Plugin updated successfully."
+        echo "${last##* }" >> "$STUB_UPDATE_LOG"
+        exit 0 ;;
+esac
 {
     echo "-- MySQL dump 10.13  Distrib 8.0.0"
     echo "CREATE TABLE wp_posts (ID bigint, post_content longtext);"
@@ -136,6 +149,7 @@ run() {   # run <args...> — sandboxed; override RUN_DIR / STUB_WP / STUB_UPLOA
         KEEP_SQL="${KEEP_SQL:-3}" \
         STUB_WP="${STUB_WP:-$WANT_WP}" \
         STUB_UPLOADS="${STUB_UPLOADS:-$WANT_UPLOADS}" \
+        STUB_UPDATE_LOG="$TMP/updated.log" \
         bash "$SCRIPT" "$@" 2>&1)"
     RC=$?
     # A `VAR=x run ...` prefix on a *function* persists after the call in bash,
@@ -393,6 +407,56 @@ if [ -n "$TAR" ]; then
 else
     bad "builds a .tar.zst"
 fi
+
+# ── plugins ─────────────────────────────────────────────────────────────────
+group "plugins"
+
+# composer.json owns "in-composer"; "server-only" is nobody's but the server's
+cat > "$SITE_DIR/composer.json" <<'EOS'
+{
+  "require": {
+    "php": ">=8.2",
+    "wpackagist-plugin/in-composer": "^1.0",
+    "vendor/unrelated-library": "^2.0"
+  }
+}
+EOS
+
+: > "$TMP/updated.log"
+run plugins
+assert_rc 0 "plugins lists without touching anything"
+assert_has "in-composer" "shows a plugin Composer owns"
+assert_has "composer"    "...labelled as Composer's"
+assert_has "server-only" "shows a plugin the server owns"
+assert_has "--update"    "says how to apply them"
+assert_eq "$(wc -l < "$TMP/updated.log" | tr -d ' ')" "0" \
+          "listing updates nothing"
+case "$OUT" in
+    *up-to-date*) bad "hides plugins with no update pending" ;;
+    *)            ok  "hides plugins with no update pending" ;;
+esac
+
+: > "$TMP/updated.log"
+run plugins --update -n
+assert_rc 0 "plugins --update -n succeeds"
+assert_has "would update server-only" "dry run names what it would do"
+assert_eq "$(wc -l < "$TMP/updated.log" | tr -d ' ')" "0" \
+          "dry run updates nothing"
+
+: > "$TMP/updated.log"
+run plugins --update
+assert_rc 0 "plugins --update succeeds"
+assert_eq "$(cat "$TMP/updated.log")" "server-only" \
+          "updates only the plugin Composer does not own"
+
+# With no composer.json, nothing is Composer's and everything is fair game
+mv "$SITE_DIR/composer.json" "$TMP/composer.json.bak"
+: > "$TMP/updated.log"
+run plugins --update
+assert_rc 0 "works on a site with no composer.json"
+assert_eq "$(sort "$TMP/updated.log" | tr '\n' ' ')" "in-composer server-only " \
+          "...where every pending update is fair game"
+mv "$TMP/composer.json.bak" "$SITE_DIR/composer.json"
 
 # ── retention ───────────────────────────────────────────────────────────────
 group "retention"
