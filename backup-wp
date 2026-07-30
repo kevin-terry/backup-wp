@@ -69,7 +69,8 @@ options
   -f, --force       skip the first-run confirmation before an rsync --delete
       --no-prune    keep every old snapshot instead of trimming to $KEEP
       --no-rescue   delete outright instead of moving replaced files aside
-      --update      with `plugins`, actually apply the updates
+      --update      with `plugins`, apply every server-managed update
+      --update=a,b  ...or only the plugins named
       --setup       (re)run discovery for this site and rewrite its config
       --host <a>    set up against ssh alias <a> without asking (implies --setup)
       --list        list configured sites and exit
@@ -90,7 +91,7 @@ EOF
 
 # ── argument parsing ────────────────────────────────────────────────────────
 SITE=""; WHAT=""; ARCHIVE=0; DRY=0; FORCE=0; PRUNE=1; SETUP=0; HOST_ARG=""
-RESCUE_ON=1; APPLY=0
+RESCUE_ON=1; APPLY=0; ONLY=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -103,6 +104,8 @@ while [ $# -gt 0 ]; do
         --no-prune)    PRUNE=0 ;;
         --no-rescue)   RESCUE_ON=0 ;;
         --update)      APPLY=1 ;;
+        --update=*)    APPLY=1; ONLY="${1#--update=}"
+                       [ -n "$ONLY" ] || die "--update= needs a plugin name" ;;
         --setup)       SETUP=1 ;;
         --host)        shift; [ $# -gt 0 ] || die "--host needs an ssh alias"
                        HOST_ARG="$1"; SETUP=1 ;;
@@ -622,10 +625,30 @@ EOF
         warn "their update checks there may be missing from this list"
     fi
 
+    # --update=a,b narrows to named plugins. Every name is checked against what
+    # was actually found, so a typo stops the run instead of quietly updating
+    # nothing and looking like success.
+    if [ -n "$ONLY" ]; then
+        in_list() { case " $2 " in *" $1 "*) return 0 ;; esac; return 1; }
+        chosen=""
+        for want in $(printf '%s' "$ONLY" | tr ',' ' '); do
+            if in_list "$want" "$updatable"; then
+                chosen="$chosen $want"
+            elif printf '%s\n' "$owned" | grep -qx "$want"; then
+                die "$want is Composer-managed — update it with \`composer update\` locally, or the next deploy reverts it"
+            elif in_list "$want" "$(printf '%s' "$silent" | tr ':' ' ')"; then
+                die "$want reports no updater, so there is no update to fetch — update it by hand"
+            else
+                die "$want is not a server-managed plugin with a pending update (see: backup-wp $SITE plugins)"
+            fi
+        done
+        updatable="$chosen"
+    fi
+
     if [ -z "$updatable" ]; then
         info "nothing to update on the server"
     elif [ "$APPLY" -eq 0 ]; then
-        info "run with ${B}--update${RST} to update the server-managed one(s)"
+        info "run with ${B}--update${RST} for all of these, or ${B}--update=<name>${RST} for one"
     else
         for p in $updatable; do
             if [ "$DRY" -eq 1 ]; then

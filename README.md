@@ -122,7 +122,8 @@ Options:
 | `-f, --force`    | skip the first-run confirmation before `rsync --delete` |
 | `--no-prune`     | keep every old snapshot instead of trimming             |
 | `--no-rescue`    | delete outright instead of moving replaced files aside  |
-| `--update`       | with `plugins`, actually apply the updates              |
+| `--update`       | with `plugins`, apply every server-managed update       |
+| `--update=a,b`   | ...or only the plugins named                            |
 | `--setup`        | re-run discovery and rewrite this site's config         |
 | `--host <alias>` | set up against an SSH alias without asking              |
 | `--list`         | show every configured site                              |
@@ -200,8 +201,10 @@ have to name, and a flag you have to add.
 ## Plugin updates
 
 ```bash
-backup-wp plugins            # what has updates, and who owns each one
-backup-wp plugins --update   # apply the ones the server owns
+backup-wp plugins                     # what has updates, and who owns each one
+backup-wp plugins --update            # apply every server-managed one
+backup-wp plugins --update=some-plugin  # ...or just the one you trust
+backup-wp plugins --update=a,b -n     # dry run a chosen few
 ```
 
 ```console
@@ -254,8 +257,16 @@ refresh its cached `update_plugins` transient, which is a database write. Every
 admin page load does the same and WordPress redoes it twice a day anyway, so
 `plugins` changes nothing — but it isn't strictly read-only either.
 
+Not every plugin is one you want to touch on a whim. `--update=<name>` narrows
+to the ones you name, so a flaky plugin can sit at its current version while the
+rest move on. Names are checked against what was actually found: a typo, a
+Composer-managed plugin, or one with no updater all stop the run with a reason
+rather than quietly updating nothing and looking like success.
+
 Back up first — `backup-wp pre` — and it's a normal `wp plugin update` behind
-the scenes, so anything it can't do, wp-cli couldn't either.
+the scenes, so anything it can't do, wp-cli couldn't either. Note that these
+backups cover the database and uploads, not plugin files: if an update goes
+badly, reinstalling the old version is a manual job.
 
 ## Configuration
 

@@ -471,6 +471,31 @@ run plugins --update
 assert_eq "$(sort "$TMP/updated.log" | tr '\n' ' ')" "premium-thing server-only " \
           "--update covers the licensed plugin too"
 
+# --update=<name> narrows to one plugin, leaving the rest alone
+: > "$TMP/updated.log"
+run plugins --update=server-only
+assert_rc 0 "--update=<name> succeeds"
+assert_eq "$(cat "$TMP/updated.log")" "server-only" "...updating only that plugin"
+
+: > "$TMP/updated.log"
+run plugins --update=server-only,premium-thing
+assert_rc 0 "--update accepts a comma-separated list"
+assert_eq "$(sort "$TMP/updated.log" | tr '\n' ' ')" "premium-thing server-only " \
+          "...updating each one named"
+
+# A typo must stop the run, not silently update nothing and look successful
+: > "$TMP/updated.log"
+run plugins --update=no-such-plugin
+assert_rc 1 "an unknown plugin name is refused"
+assert_has "not a server-managed plugin" "...with a clear reason"
+assert_eq "$(wc -l < "$TMP/updated.log" | tr -d ' ')" "0" "...having updated nothing"
+
+: > "$TMP/updated.log"
+run plugins --update=in-composer
+assert_rc 1 "naming a Composer-managed plugin is refused"
+assert_has "Composer-managed" "...explaining who owns it"
+assert_eq "$(wc -l < "$TMP/updated.log" | tr -d ' ')" "0" "...having updated nothing"
+
 # If admin context cannot be loaded, fall back rather than fail — and say so,
 # because the fallback is exactly the case that hides licensed updates.
 : > "$TMP/context.log"
