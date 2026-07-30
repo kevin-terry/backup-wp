@@ -129,6 +129,7 @@ Options:
 | `-n, --dry-run`  | show what would happen; transfer nothing                |
 | `-f, --force`    | skip the first-run confirmation before `rsync --delete` |
 | `--no-prune`     | keep every old snapshot instead of trimming             |
+| `--no-rescue`    | delete outright instead of moving replaced files aside  |
 | `--setup`        | re-run discovery and rewrite this site's config         |
 | `--host <alias>` | set up against an SSH alias without asking              |
 | `--list`         | show every configured site                              |
@@ -140,6 +141,7 @@ Options:
     <site>-db-20260130-091200-pre.sql.gz
     <site>-db-20260130-104300-post.sql.gz
     <site>-uploads-20260130-104300.tar.zst
+    rescued-20260130-104300/            <- anything the mirror replaced
 
 ~/Sites/<site>/public_html/uploads/     <- mirror of production
 ~/Sites/<site>/sql/latest.sql           <- newest dump, uncompressed
@@ -159,15 +161,31 @@ wp db import sql/latest.sql
 
 Worth reading once, since this is the only part that removes anything.
 
-**The uploads mirror is exact.** It runs `rsync --delete`, so a file that
-exists locally but not on production is removed. That's what makes it a
-faithful backup. The first time it mirrors into a non-empty folder it counts
-what would be deleted and asks; after that it never asks again for that site.
-To see the list without touching anything:
+**The uploads mirror is exact, but nothing is destroyed.** It runs
+`rsync --delete`, so a file that exists locally but not on production is taken
+out of the mirror — that's what makes it a faithful copy. Before that happens,
+anything about to be deleted *or overwritten* is moved into a dated folder
+beside that run's archives:
+
+```text
+~/Site Backups/<year>/<month>/<site>/rescued-20260130-104300/
+    2025/08/a-file-only-you-had.pdf
+```
+
+Original paths are preserved, so putting something back is a `cp`. Rescue
+folders sit outside the path retention looks at, so they're never trimmed —
+they accumulate until you clear them out, which is the intended trade.
+
+The first time it mirrors into a non-empty folder it still counts what would go
+and asks, since a surprising number usually means the wrong directory rather
+than the wrong files. After that it never asks again for that site. To see the
+list without touching anything:
 
 ```bash
 backup-wp uploads --dry-run
 ```
+
+`--no-rescue` skips the safety net and deletes outright.
 
 **Retention is narrow on purpose.** Old snapshots are trimmed to the newest
 `$KEEP` (default 10), but only files sitting _exactly_ here:

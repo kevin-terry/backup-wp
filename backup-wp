@@ -66,6 +66,7 @@ options
   -n, --dry-run     show what would happen; transfers nothing
   -f, --force       skip the first-run confirmation before an rsync --delete
       --no-prune    keep every old snapshot instead of trimming to $KEEP
+      --no-rescue   delete outright instead of moving replaced files aside
       --setup       (re)run discovery for this site and rewrite its config
       --host <a>    set up against ssh alias <a> without asking (implies --setup)
       --list        list configured sites and exit
@@ -78,11 +79,15 @@ project's sql/ dir as latest.sql so it is one command to import.
 Retention only ever considers files sitting exactly at
 <root>/<year>/<month>/<site>/<site>-db-*.sql.gz (or -uploads-*.tar.zst).
 Anything you file anywhere else under the backup root is never touched.
+
+The uploads mirror is exact, so it removes local files production does not
+have. They are moved to <...>/<site>/rescued-<stamp>/ first, not deleted.
 EOF
 }
 
 # ── argument parsing ────────────────────────────────────────────────────────
 SITE=""; WHAT=""; ARCHIVE=0; DRY=0; FORCE=0; PRUNE=1; SETUP=0; HOST_ARG=""
+RESCUE_ON=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -93,6 +98,7 @@ while [ $# -gt 0 ]; do
         -n|--dry-run)  DRY=1 ;;
         -f|--force)    FORCE=1 ;;
         --no-prune)    PRUNE=0 ;;
+        --no-rescue)   RESCUE_ON=0 ;;
         --setup)       SETUP=1 ;;
         --host)        shift; [ $# -gt 0 ] || die "--host needs an ssh alias"
                        HOST_ARG="$1"; SETUP=1 ;;
@@ -433,6 +439,16 @@ if [ "$DO_UP" -eq 1 ]; then
         --exclude '.DS_Store'
         -e "ssh ${SSH_OPTS[*]}")
 
+    # Anything the mirror is about to delete or overwrite is moved aside first,
+    # into a dated folder beside this run's archives. rsync does this itself, so
+    # it costs no extra pass and no file list to parse — and it turns an exact
+    # mirror from a one-way door into something you can undo by hand.
+    RESCUE="$SITE_BACKUPS/rescued-$STAMP"
+    if [ "$RESCUE_ON" -eq 1 ]; then
+        mkdir -p "$SITE_BACKUPS"
+        RSYNC_ARGS+=(--backup --backup-dir="$RESCUE")
+    fi
+
     # An exact mirror deletes local-only files, which is what a backup wants
     # but not what you want to discover the first time you point this at a
     # project that has dev media in it. Confirm once, then never again.
@@ -442,12 +458,17 @@ if [ "$DO_UP" -eq 1 ]; then
                     "$SSH_HOST:$REMOTE_UPLOADS/" "$LOCAL_UPLOADS/" \
                  | grep -c '^deleting ' || true)
         if [ "$doomed" -gt 0 ]; then
-            warn "first mirror of $LOCAL_UPLOADS would delete $doomed local file(s) not on production"
-            have_tty || die "no terminal to confirm on. List them with \`backup-wp $SITE uploads -n\`, then pass --force to accept the deletions."
+            warn "first mirror of $LOCAL_UPLOADS would remove $doomed local file(s) not on production"
+            if [ "$RESCUE_ON" -eq 1 ]; then
+                info "they will be copied to $RESCUE first"
+            else
+                warn "--no-rescue is set, so they will be gone for good"
+            fi
+            have_tty || die "no terminal to confirm on. List them with \`backup-wp $SITE uploads -n\`, then pass --force to go ahead."
             read -r -p "    continue? [y/N] " ok </dev/tty
             case "$ok" in
                 [yY]*) ;;
-                *) die "stopped, nothing deleted. List them with \`backup-wp $SITE uploads -n\`." ;;
+                *) die "stopped, nothing removed. List them with \`backup-wp $SITE uploads -n\`." ;;
             esac
         fi
     fi
@@ -455,6 +476,12 @@ if [ "$DO_UP" -eq 1 ]; then
     if [ "$DRY" -eq 1 ]; then RSYNC_ARGS+=(-n); fi
     "$RSYNC" "${RSYNC_ARGS[@]}" "$SSH_HOST:$REMOTE_UPLOADS/" "$LOCAL_UPLOADS/"
     if [ "$DRY" -eq 0 ]; then : > "$MIRRORED"; fi
+
+    if [ "$DRY" -eq 0 ] && [ -d "$RESCUE" ]; then
+        info "$(find "$RESCUE" -type f | wc -l | tr -d ' ') file(s) moved aside → $RESCUE"
+    fi
+    # Leaves no empty dated folder behind on a run that rescued nothing.
+    rmdir "$SITE_BACKUPS" 2>/dev/null || true
 
     if [ "$ARCHIVE" -eq 1 ]; then
         step "Archive"

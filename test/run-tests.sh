@@ -93,18 +93,30 @@ chmod +x "$STUB/ssh"
 }
 write_ssh_stub
 
-# rsync stub: honours -n by reporting deletions instead of performing them.
+# rsync stub: honours -n by reporting deletions instead of performing them, and
+# honours --backup-dir by moving local-only files there the way real rsync does.
 cat > "$STUB/rsync" <<'EOS'
 #!/usr/bin/env bash
-dry=0
+dry=0; backup_dir=""
 for a in "$@"; do
     [ "$a" = "-n" ] && dry=1
+    case "$a" in --backup-dir=*) backup_dir="${a#--backup-dir=}" ;; esac
     dest="$a"
 done
 if [ "$dry" -eq 1 ]; then
     echo "deleting 2020/01/local-only.jpg"
     echo "Number of files: 3"
     exit 0
+fi
+# anything already in dest that we are not about to write is "local only"
+if [ -n "$backup_dir" ]; then
+    dest="${dest%/}"          # the destination arrives with a trailing slash
+    while IFS= read -r f; do
+        rel="${f#"$dest"/}"
+        case "$rel" in 2026/01/hero.jpg|2026/01/logo.png) continue ;; esac
+        mkdir -p "$backup_dir/$(dirname "$rel")"
+        mv "$f" "$backup_dir/$rel"
+    done < <(find "$dest" -type f 2>/dev/null)
 fi
 mkdir -p "$dest/2026/01"
 echo hero > "$dest/2026/01/hero.jpg"
@@ -333,6 +345,39 @@ assert_has "--force" "...and points at the way forward"
 
 run uploads --force
 assert_rc 0 "--force proceeds without asking"
+
+# A local-only file must be moved aside, not destroyed, when the mirror runs.
+mkdir -p "$UPLOADS/2019/09"
+echo "irreplaceable" > "$UPLOADS/2019/09/local-only.jpg"
+run uploads
+assert_rc 0 "sync with a local-only file succeeds"
+assert_has "moved aside" "reports what it moved aside"
+RESCUED="$(find "$BACKUPS" -type d -name 'rescued-*' | head -1)"
+if [ -n "$RESCUED" ] && [ -f "$RESCUED/2019/09/local-only.jpg" ]; then
+    ok "rescues the local-only file, preserving its path"
+else
+    bad "rescues the local-only file, preserving its path"
+fi
+assert_eq "$(cat "$RESCUED/2019/09/local-only.jpg" 2>/dev/null)" "irreplaceable" \
+          "the rescued copy still has its contents"
+assert_eq "$(find "$UPLOADS" -name local-only.jpg | wc -l | tr -d ' ')" "0" \
+          "and the mirror itself is exact afterwards"
+
+# --no-rescue means what it says
+mkdir -p "$UPLOADS/2019/09"
+echo "expendable" > "$UPLOADS/2019/09/local-only.jpg"
+before_rescues="$(find "$BACKUPS" -type d -name 'rescued-*' | wc -l | tr -d ' ')"
+run uploads --no-rescue
+assert_rc 0 "--no-rescue succeeds"
+assert_eq "$(find "$BACKUPS" -type d -name 'rescued-*' | wc -l | tr -d ' ')" \
+          "$before_rescues" "--no-rescue creates no rescue folder"
+
+# rescued files must be immune to retention, whatever they are called
+mkdir -p "$RESCUED"
+: > "$RESCUED/$SITE-db-20200101-000000.sql.gz"
+KEEP=1 run db
+assert_file "$RESCUED/$SITE-db-20200101-000000.sql.gz" \
+            "retention cannot reach inside a rescue folder"
 
 run uploads --archive
 assert_rc 0 "archive run succeeds"

@@ -33,6 +33,10 @@ Break any of these and the tool stops being trustworthy:
   matches. Widening that search is a data-loss bug.
 - **Guessing is always announced.** Where a path can't be derived, the script
   says it guessed and names the setting to correct.
+- **The mirror never destroys.** `rsync --backup --backup-dir` moves anything
+  about to be deleted or overwritten into `rescued-<stamp>/` beside that run's
+  archives. Reach for rsync's own facilities before hand-rolling: this needs no
+  extra pass and no file list to parse. `--no-rescue` opts out.
 
 ## Constraints worth knowing
 
