@@ -1,0 +1,274 @@
+# backup-wp
+
+Pull a WordPress site's **database and uploads** down from production with one
+command. No control panel, no zipping things up on the server, no downloading
+archives by hand.
+
+```bash
+backup-wp pre     # database snapshot, before you deploy
+backup-wp post    # database snapshot + uploads mirror, after
+```
+
+Nothing is ever written to the server. The database streams out of `wp-cli`
+already compressed; the uploads come down as an rsync delta transfer, so the
+second run only moves what changed.
+
+## Why
+
+The usual update routine for a self-managed WordPress site looks like this:
+
+1. Update dependencies locally, test, commit, deploy.
+2. Log into the host's control panel, export the database, download it.
+3. Log back in, archive the uploads folder, download it, delete the archive.
+4. Export the database again once everything is updated.
+
+Steps 2–4 are clicking, waiting, and remembering. This replaces them with two
+commands you can run without leaving your project directory.
+
+## Fair warning
+
+I built this for my own setup — a handful of WordPress sites I maintain and got
+tired of backing up by hand. It works well for me. It might work for you.
+
+It should work on most shared hosting and VPS servers that have `wp-cli`
+installed. I haven't tested it on managed WordPress hosts like WP Engine, which
+tend to wrap SSH in their own tooling.
+
+Read the script before pointing it at anything you care about — it's short on
+purpose. Reports from other hosts are welcome, but treat this as "here, try it"
+rather than something I'll be supporting.
+
+## Requirements
+
+**Local:** `bash`, `rsync`, `gzip`, `tar`, `zstd`, and an SSH key that gets you
+into the server.
+
+**Remote:** `wp-cli` on the `PATH`, and `mysqldump` (which `wp db export` uses).
+Most shared hosts with SSH access have both.
+
+## Install
+
+```bash
+git clone https://github.com/kevin-terry/backup-wp.git
+cd backup-wp
+make install          # symlinks backup-wp into ~/.local/bin
+```
+
+`make install` only creates a symlink, so `git pull` updates the tool
+immediately. `make uninstall` removes the link. If `~/.local/bin` isn't on your
+`PATH`, add it:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Prefer somewhere else? `make install PREFIX=/usr/local`.
+
+## First run
+
+Run it inside a project and it asks one question — which SSH host — then works
+out everything else by asking the server directly:
+
+```console
+$ cd ~/Sites/example-site
+$ backup-wp pre
+
+==> Setting up example-site
+    project  /home/user/Sites/example-site
+
+    SSH hosts in ~/.ssh/config:
+       1) example-prod
+       2) other-prod
+
+    Which host serves example-site? (number, or user@host) 1
+==> Checking example-prod
+==> Looking for WordPress on example-prod
+==> Saved ~/.config/backup-wp/example-site.conf
+```
+
+It finds WordPress by locating `wp-cli.yml` / `wp-config.php` under the remote
+`$HOME`, confirms each candidate with `wp core version`, and asks WordPress
+itself where uploads live (`wp_upload_dir()`) rather than guessing. If exactly
+one install checks out, it doesn't even ask.
+
+The answers are saved per site, so it never asks twice. To skip the question
+entirely — handy for scripting — pass the alias:
+
+```bash
+backup-wp --host example-prod
+```
+
+## Everyday use
+
+```bash
+backup-wp pre                  # DB only, tagged "pre"
+backup-wp post                 # DB tagged "post" + uploads mirror
+backup-wp post --archive       # ...and a dated .tar.zst of the uploads
+backup-wp db                   # DB only, untagged
+backup-wp uploads              # uploads only
+backup-wp                      # DB + uploads
+```
+
+The site is taken from whichever project directory you're standing in. To work
+on another site from anywhere, name it:
+
+```bash
+backup-wp example-site pre
+```
+
+Options:
+
+| Flag             | Effect                                                  |
+| ---------------- | ------------------------------------------------------- |
+| `-a, --archive`  | also build a dated `.tar.zst` of the uploads            |
+| `-n, --dry-run`  | show what would happen; transfer nothing                |
+| `-f, --force`    | skip the first-run confirmation before `rsync --delete` |
+| `--no-prune`     | keep every old snapshot instead of trimming             |
+| `--setup`        | re-run discovery and rewrite this site's config         |
+| `--host <alias>` | set up against an SSH alias without asking              |
+| `--list`         | show every configured site                              |
+
+## Where things land
+
+```text
+~/Site Backups/<year>/<month>/<site>/
+    <site>-db-20260130-091200-pre.sql.gz
+    <site>-db-20260130-104300-post.sql.gz
+    <site>-uploads-20260130-104300.tar.zst
+
+~/Sites/<site>/public_html/uploads/     <- mirror of production
+~/Sites/<site>/sql/latest.sql           <- newest dump, uncompressed
+```
+
+The uploads sync into your project so your local site has the real media. The
+compressed copies go somewhere central you can push off-machine.
+
+Because the newest dump is also dropped in the project as plain SQL, importing
+is one command:
+
+```bash
+wp db import sql/latest.sql
+```
+
+## What gets deleted
+
+Worth reading once, since this is the only part that removes anything.
+
+**The uploads mirror is exact.** It runs `rsync --delete`, so a file that
+exists locally but not on production is removed. That's what makes it a
+faithful backup. The first time it mirrors into a non-empty folder it counts
+what would be deleted and asks; after that it never asks again for that site.
+To see the list without touching anything:
+
+```bash
+backup-wp uploads --dry-run
+```
+
+**Retention is narrow on purpose.** Old snapshots are trimmed to the newest
+`$KEEP` (default 10), but only files sitting _exactly_ here:
+
+```text
+<backup root>/<year>/<month>/<site>/<site>-db-*.sql.gz
+<backup root>/<year>/<month>/<site>/<site>-uploads-*.tar.zst
+```
+
+Anything you file anywhere else under the backup root is invisible to it —
+even if the name matches. A `manual/` folder, loose files at the root, notes,
+exports under their own names: all safe indefinitely. `--no-prune` skips
+trimming entirely.
+
+**Nothing on the server is ever created, modified, or deleted.**
+
+## Configuration
+
+Per-site answers live in `~/.config/backup-wp/<site>.conf` — plain shell
+variables, safe to edit by hand:
+
+```bash
+SITE_DIR="/home/user/Sites/example-site"
+SSH_HOST="example-prod"                 # an ~/.ssh/config alias
+REMOTE_WP="/home/user/sites/example.com"
+REMOTE_WP_BIN="/usr/local/bin/wp"
+REMOTE_UPLOADS="/home/user/sites/example.com/public_html/uploads"
+LOCAL_UPLOADS="/home/user/Sites/example-site/public_html/uploads"
+```
+
+Storing the SSH _alias_ rather than a hostname means a host change only needs
+fixing in `~/.ssh/config`.
+
+A sibling `<site>.mirrored` marker appears after the first successful uploads
+sync; it's what suppresses the deletion confirmation on later runs. Delete it
+to get that one-time check back.
+
+Environment overrides:
+
+| Variable      | Default                                |
+| ------------- | -------------------------------------- |
+| `BACKUP_ROOT` | `~/Site Backups`                       |
+| `SITES_DIR`   | `~/Sites`                              |
+| `KEEP`        | `10` snapshots per type, per site      |
+| `KEEP_SQL`    | `3` plain `.sql` copies in the project |
+| `RSYNC`       | first `rsync` on `PATH`                |
+
+## Directory names are never assumed
+
+Nothing here has a list of docroot names in it. `public_html`, `httpdocs`,
+`htdocs`, `web`, `public` — all work without configuration, because both sides
+are worked out by structure:
+
+- **Remote:** WordPress is found by locating `wp-cli.yml` / `wp-config.php`, and
+  the uploads path comes from WordPress itself via `wp_upload_dir()`. Whatever
+  your host calls its folders is irrelevant.
+- **Local:** the mirror path is derived from where the uploads sit _relative to_
+  the remote project root, then applied to your project. A docroot called
+  `httpdocs` lands at `httpdocs/...` locally without anything being named.
+- **Is this a project at all?** Decided by looking for `wp-cli.yml`,
+  `wp-config.php` or `wp-load.php`, not by directory name.
+
+The one case that can't be derived is uploads stored _outside_ the remote
+project root — a shared or symlinked media directory. Then the script looks for
+an existing `uploads` folder in your project and **tells you it guessed**, so
+you can correct `LOCAL_UPLOADS` before the first sync.
+
+Every discovered value is a plain variable in the site's `.conf`. If any of it
+is wrong for your setup, edit it — nothing is baked into the script.
+
+## Troubleshooting
+
+**"found no working WordPress install"** — the search covers 5 levels below the
+remote `$HOME`. If the install is deeper, or lives outside `$HOME`, set
+`REMOTE_WP` and `REMOTE_UPLOADS` by hand in the site's `.conf`.
+
+**"does not look like a WordPress project"** — the directory has no
+`wp-cli.yml`, `wp-config.php` or `wp-load.php` within three levels. Either
+you're in the wrong directory, or the project is nested unusually deep; naming
+the site (`backup-wp <site>`) skips the check.
+
+**"the mirror path is a guess"** — your uploads live outside the remote project
+root, so there was nothing to derive the local path from. Set `LOCAL_UPLOADS`
+in the site's `.conf` to wherever the mirror belongs.
+
+**"cannot reach &lt;host&gt; over ssh"** — check the alias resolves and connects on
+its own first: `ssh <alias>`. Shared hosts sometimes retire hostnames while
+your user, key, and port stay valid; only `HostName` needs updating.
+
+**It asks for a passphrase every run** — that's ssh, not this tool. On macOS,
+`ssh-add --apple-use-keychain ~/.ssh/your-key` stores it once. A single
+connection is reused for the whole run, so you'll never be asked twice.
+
+**"no terminal to confirm on"** — a prompt was needed but stdin isn't a
+terminal. Run it interactively, or pass `--host` / `--force` as the message
+suggests.
+
+## Development
+
+```bash
+make test     # offline test suite — stubs ssh and rsync, no server needed
+make lint     # shellcheck
+```
+
+The tests fake the network, so they run anywhere and never touch a real host.
+
+## License
+
+MIT

@@ -1,0 +1,499 @@
+#!/usr/bin/env bash
+#
+# backup-wp — pull a WordPress site's database and uploads down from production.
+#
+#   backup-wp pre                  # DB snapshot, before you deploy
+#   backup-wp post                 # DB snapshot + uploads mirror, after
+#   backup-wp post --archive       # ...and a dated tar.zst of the uploads
+#   backup-wp example-site db      # any site, from anywhere, by key
+#
+# Run it from inside a site's project directory and it works out which site you
+# mean, the same way `git deploy` does. The first time it sees a site it asks
+# for the SSH host, discovers the WordPress root and uploads directory on the
+# server itself, and remembers all of it in ~/.config/backup-wp/<site>.conf.
+# There is no site list to maintain in this file.
+#
+# Nothing is ever written to the server: the database streams out of wp-cli and
+# the uploads come down as an rsync delta transfer.
+#
+# Requires: rsync, zstd, and an SSH alias per site in ~/.ssh/config.
+
+set -euo pipefail
+
+# ── settings ────────────────────────────────────────────────────────────────
+SITES_DIR="${SITES_DIR:-$HOME/Sites}"
+BACKUP_ROOT="${BACKUP_ROOT:-$HOME/Site Backups}"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/backup-wp"
+RSYNC="${RSYNC:-$(command -v rsync)}"
+
+KEEP="${KEEP:-10}"          # dated copies to keep, per artifact type, per site
+KEEP_SQL="${KEEP_SQL:-3}"   # plain .sql working copies to keep in the project
+
+STAMP="$(date +%Y%m%d-%H%M%S)"
+DEST_DIR="$BACKUP_ROOT/$(date +%Y)/$(date +%m)"
+
+# ── output ──────────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+    B=$'\033[1m'; DIM=$'\033[2m'; GRN=$'\033[32m'; YEL=$'\033[33m'
+    RED=$'\033[31m'; RST=$'\033[0m'
+else
+    B=''; DIM=''; GRN=''; YEL=''; RED=''; RST=''
+fi
+
+# Can we actually reach a terminal to ask a question? `[ -t 0 ]` is not enough:
+# stdin may be a pipe while /dev/tty is perfectly usable, and under some
+# runners /dev/tty exists but cannot be opened. Try it, quietly.
+have_tty() { (exec </dev/tty) 2>/dev/null; }
+
+step() { printf '%s==>%s %s\n' "$B" "$RST" "$*"; }
+info() { printf '    %s%s%s\n' "$DIM" "$*" "$RST"; }
+warn() { printf '%s !! %s%s\n' "$YEL" "$*" "$RST" >&2; }
+die()  { printf '%serror:%s %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+usage: backup-wp [<site>] [<what>] [options]
+
+what
+  pre        database only, tagged "pre"        (run before `git deploy`)
+  post       database tagged "post" + uploads   (run after the deploy)
+  db         database only, untagged
+  uploads    uploads mirror only
+  all        database + uploads                 (the default)
+
+options
+  -a, --archive     also build a dated .tar.zst of the uploads
+  -n, --dry-run     show what would happen; transfers nothing
+  -f, --force       skip the first-run confirmation before an rsync --delete
+      --no-prune    keep every old snapshot instead of trimming to $KEEP
+      --setup       (re)run discovery for this site and rewrite its config
+      --host <a>    set up against ssh alias <a> without asking (implies --setup)
+      --list        list configured sites and exit
+  -h, --help        this
+
+Site is taken from the current project directory when omitted. Backups land in
+"~/Site Backups/<year>/<month>/<site>/"; the newest .sql is also dropped in the
+project's sql/ dir as latest.sql so it is one command to import.
+
+Retention only ever considers files sitting exactly at
+<root>/<year>/<month>/<site>/<site>-db-*.sql.gz (or -uploads-*.tar.zst).
+Anything you file anywhere else under the backup root is never touched.
+EOF
+}
+
+# ── argument parsing ────────────────────────────────────────────────────────
+SITE=""; WHAT=""; ARCHIVE=0; DRY=0; FORCE=0; PRUNE=1; SETUP=0; HOST_ARG=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        pre|post|db|uploads|all)
+            [ -z "$WHAT" ] || die "more than one action given: $WHAT and $1"
+            WHAT="$1" ;;
+        -a|--archive)  ARCHIVE=1 ;;
+        -n|--dry-run)  DRY=1 ;;
+        -f|--force)    FORCE=1 ;;
+        --no-prune)    PRUNE=0 ;;
+        --setup)       SETUP=1 ;;
+        --host)        shift; [ $# -gt 0 ] || die "--host needs an ssh alias"
+                       HOST_ARG="$1"; SETUP=1 ;;
+        --list)
+            ls "$CONF_DIR"/*.conf >/dev/null 2>&1 || die "no sites configured yet"
+            for f in "$CONF_DIR"/*.conf; do
+                # Sourcing a runtime path is the point; read in a subshell so
+                # one site's values cannot leak into the next iteration.
+                # shellcheck disable=SC1090
+                ( . "$f"
+                  printf '%s%s%s\n' "$B" "$(basename "$f" .conf)" "$RST"
+                  printf '    %-9s %s\n' host "$SSH_HOST"
+                  printf '    %-9s %s\n' remote "$REMOTE_WP"
+                  printf '    %-9s %s\n' uploads "$REMOTE_UPLOADS"
+                  printf '    %-9s %s\n' local "$SITE_DIR" )
+            done
+            exit 0 ;;
+        -h|--help)     usage; exit 0 ;;
+        -*)            die "unknown option: $1" ;;
+        *)
+            [ -z "$SITE" ] || die "more than one site given: $SITE and $1"
+            SITE="$1" ;;
+    esac
+    shift
+done
+
+WHAT="${WHAT:-all}"
+case "$WHAT" in
+    pre)     DO_DB=1; DO_UP=0; LABEL="pre"  ;;
+    post)    DO_DB=1; DO_UP=1; LABEL="post" ;;
+    db)      DO_DB=1; DO_UP=0; LABEL=""     ;;
+    uploads) DO_DB=0; DO_UP=1; LABEL=""     ;;
+    all)     DO_DB=1; DO_UP=1; LABEL=""     ;;
+esac
+
+# ── which site? ─────────────────────────────────────────────────────────────
+# Recognise a project by structure, never by directory name. Docroots get
+# called public_html, public, web, htdocs, httpdocs, wordpress and plenty else;
+# a hardcoded list would turn away a perfectly valid project.
+looks_like_wp_project() {
+    if [ -e "$1/wp-cli.yml" ] || [ -e "$1/wp-config.php" ]; then return 0; fi
+    local d
+    for d in "$1"/*/; do          # one level down, whatever the docroot is called
+        if [ -e "${d}wp-config.php" ] || [ -e "${d}wp-load.php" ]; then return 0; fi
+    done
+    # Deeper or unusually nested layouts. One bounded search, pruning the trees
+    # that are always huge and never hold a wp-config.php. No pipe into head:
+    # under `set -o pipefail` a SIGPIPE'd find would read as "not found".
+    local hit
+    hit="$(find "$1" -maxdepth 3 \
+             \( -name node_modules -o -name vendor -o -name .git \) -prune -o \
+             \( -name wp-config.php -o -name wp-load.php \) -print 2>/dev/null)"
+    [ -n "$hit" ]
+}
+
+# No argument: use the git top level of wherever we are, exactly like
+# `git deploy`. An argument is a key under ~/Sites, or a site we already know.
+if [ -z "$SITE" ]; then
+    root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+    SITE="$(basename "$root")"
+    SITE_DIR="$root"
+    looks_like_wp_project "$SITE_DIR" \
+        || die "$(printf '%s does not look like a WordPress project.\n       cd into one, or name a site: backup-wp <site> %s' "$SITE_DIR" "$WHAT")"
+elif [ -d "$SITES_DIR/$SITE" ]; then
+    SITE_DIR="$SITES_DIR/$SITE"
+elif [ -r "$CONF_DIR/$SITE.conf" ]; then
+    SITE_DIR=""   # filled in from the config below
+else
+    die "no site \"$SITE\" in $SITES_DIR and no config for it. Run: backup-wp $SITE --setup"
+fi
+
+CONF="$CONF_DIR/$SITE.conf"
+
+# ── first run: ask once, discover the rest, never ask again ─────────────────
+pick_ssh_host() {
+    # Host aliases from ~/.ssh/config, minus wildcards.
+    local -a hosts=()
+    if [ -r "$HOME/.ssh/config" ]; then
+        set -f   # a bare `Host *` would otherwise glob against the cwd
+        while read -r _ rest; do
+            for h in $rest; do
+                case "$h" in *[\*\?\!]*) continue ;; esac      # patterns, not hosts
+                case " ${hosts[*]-} " in *" $h "*) continue ;; esac
+                hosts+=("$h")
+            done
+        done < <(grep -iE '^[[:space:]]*Host[[:space:]]' "$HOME/.ssh/config" || true)
+        set +f
+    fi
+
+    if [ ${#hosts[@]} -gt 0 ]; then
+        printf '\n    %sSSH hosts in ~/.ssh/config:%s\n' "$DIM" "$RST" >&2
+        local i=1
+        for h in "${hosts[@]}"; do printf '      %2d) %s\n' "$i" "$h" >&2; i=$((i+1)); done
+        printf '\n' >&2
+    fi
+
+    local answer
+    read -r -p "    Which host serves ${B}$SITE${RST}? (number, or user@host) " answer </dev/tty 2>/dev/null \
+        || die "no terminal to ask on — pass --host <ssh-alias> instead"
+    [ -n "$answer" ] || die "no host given"
+    case "$answer" in
+        ''|*[!0-9]*) printf '%s' "$answer" ;;
+        *)
+            [ "$answer" -ge 1 ] && [ "$answer" -le ${#hosts[@]} ] || die "no host #$answer"
+            printf '%s' "${hosts[$((answer-1))]}" ;;
+    esac
+}
+
+# Everything below runs on the server, read-only, over one connection.
+probe_remote() {
+    ssh "${SSH_OPTS[@]}" "$SSH_HOST" bash -s <<'REMOTE'
+set -u
+
+wp=""
+for c in "$(command -v wp 2>/dev/null || true)" "$HOME/bin/wp" \
+         /usr/local/bin/wp /usr/bin/wp; do
+    [ -n "$c" ] && [ -x "$c" ] && { wp="$c"; break; }
+done
+[ -n "$wp" ] || { echo "NOWP"; exit 0; }
+
+# Candidate roots: anywhere a wp-cli.yml or a wp-config.php lives. When both
+# turn up, wp-cli.yml wins — that is the dir wp-cli expects to be run from.
+#
+# Resolve $HOME first and search with -L: on some shared hosts $HOME is itself
+# a symlink pointing into a shared container path, and find will not descend
+# through a symlinked starting point, so the plain form silently finds nothing.
+root="$(cd "$HOME" 2>/dev/null && pwd -P)" || root="$HOME"
+find -L "$root" -maxdepth 5 \( -name wp-cli.yml -o -name wp-config.php \) \
+     -not -path '*/vendor/*' -not -path '*/node_modules/*' \
+     2>/dev/null | while read -r f; do dirname "$f"; done | sort -u |
+while read -r dir; do
+    cd "$dir" 2>/dev/null || continue
+    "$wp" core version --skip-plugins --skip-themes >/dev/null 2>&1 || continue
+    up="$("$wp" eval 'echo wp_upload_dir()["basedir"];' 2>/dev/null)" || continue
+    [ -n "$up" ] && [ -d "$up" ] || continue
+    printf 'OK\t%s\t%s\t%s\n' "$wp" "$dir" "$up"
+done
+REMOTE
+}
+
+setup_site() {
+    step "Setting up ${B}$SITE${RST}"
+    if [ -n "$SITE_DIR" ]; then info "project  $SITE_DIR"; fi
+
+    if [ -n "$HOST_ARG" ]; then
+        SSH_HOST="$HOST_ARG"
+    else
+        have_tty || die "no config for $SITE. Run it in a terminal, or pass --host <ssh-alias>."
+        SSH_HOST="$(pick_ssh_host)"
+    fi
+
+    step "Checking $SSH_HOST"
+    ssh "${SSH_OPTS[@]}" "$SSH_HOST" true || die "cannot reach $SSH_HOST over ssh"
+
+    step "Looking for WordPress on $SSH_HOST"
+    local out; out="$(probe_remote)"
+    [ "$out" != "NOWP" ] || die "wp-cli is not on the PATH on $SSH_HOST"
+
+    # A layout that keeps its docroot in a subdirectory validates twice — once
+    # at the project root with wp-cli.yml, once at the docroot below it. Both
+    # report the same uploads dir, so keep only the first hit per uploads dir;
+    # the remote sorts its output, which puts the parent ahead of the child.
+    local -a found=() seen=()
+    local line up
+    while IFS= read -r line; do
+        case "$line" in OK$'\t'*) ;; *) continue ;; esac
+        up="$(cut -f4 <<<"$line")"
+        case " ${seen[*]-} " in *" $up "*) continue ;; esac
+        seen+=("$up")
+        found+=("$line")
+    done <<<"$out"
+    [ ${#found[@]} -gt 0 ] || die "found no working WordPress install under \$HOME on $SSH_HOST"
+
+    local choice
+    if [ ${#found[@]} -eq 1 ]; then
+        choice="${found[0]}"
+    else
+        have_tty || die "$SSH_HOST hosts ${#found[@]} installs — re-run in a terminal to pick one"
+        printf '\n    %sfound %d installs:%s\n' "$DIM" "${#found[@]}" "$RST" >&2
+        local i=1
+        for f in "${found[@]}"; do
+            printf '      %2d) %s\n' "$i" "$(cut -f3 <<<"$f")" >&2; i=$((i+1))
+        done
+        printf '\n' >&2
+        local n; read -r -p "    Which one is $SITE? " n </dev/tty 2>/dev/null \
+            || die "no terminal to ask on"
+        [ -n "$n" ] && [ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le ${#found[@]} ] || die "no install #${n:-}"
+        choice="${found[$((n-1))]}"
+    fi
+
+    REMOTE_WP_BIN="$(cut -f2 <<<"$choice")"
+    REMOTE_WP="$(cut -f3 <<<"$choice")"
+    REMOTE_UPLOADS="$(cut -f4 <<<"$choice")"
+
+    [ -n "$SITE_DIR" ] || SITE_DIR="$SITES_DIR/$SITE"
+    [ -d "$SITE_DIR" ] || die "no local project at $SITE_DIR"
+
+    # A deploy normally rsyncs the tree as-is, so uploads sit at the same path
+    # relative to the WordPress root on both ends. Deriving the local path from
+    # that relationship works for any docroot name — httpdocs, web, htdocs —
+    # without this script knowing a single one of them.
+    #
+    # Only when the remote uploads live outside the remote project root (a
+    # shared or symlinked media dir) is there no relationship to derive from.
+    # Then look for an uploads dir that already exists locally, and say plainly
+    # that the answer was a guess.
+    UPLOADS_GUESSED=0
+    case "$REMOTE_UPLOADS" in
+        # $REMOTE_WP is quoted inside the expansion so it strips as a literal
+        # prefix; unquoted it would be read as a glob pattern and a remote path
+        # containing [ ] ? * would silently fail to strip.
+        "$REMOTE_WP"/*) LOCAL_UPLOADS="$SITE_DIR/${REMOTE_UPLOADS#"$REMOTE_WP"/}" ;;
+        *)
+            UPLOADS_GUESSED=1
+            LOCAL_UPLOADS=""
+            for depth in 1 2 3; do          # shallowest match wins
+                if [ -z "$LOCAL_UPLOADS" ]; then
+                    LOCAL_UPLOADS="$(find "$SITE_DIR" -mindepth "$depth" -maxdepth "$depth" \
+                        -type d -name uploads -not -path '*/node_modules/*' \
+                        -not -path '*/vendor/*' 2>/dev/null | head -1)"
+                fi
+            done
+            LOCAL_UPLOADS="${LOCAL_UPLOADS:-$SITE_DIR/uploads}" ;;
+    esac
+
+    mkdir -p "$CONF_DIR"
+    cat > "$CONF" <<EOF
+# backup-wp — $SITE
+# discovered $(date '+%Y-%m-%d %H:%M'). Delete this file or run --setup to redo.
+SITE_DIR="$SITE_DIR"
+SSH_HOST="$SSH_HOST"
+REMOTE_WP="$REMOTE_WP"
+REMOTE_WP_BIN="$REMOTE_WP_BIN"
+REMOTE_UPLOADS="$REMOTE_UPLOADS"
+LOCAL_UPLOADS="$LOCAL_UPLOADS"
+EOF
+
+    step "Saved ${DIM}$CONF${RST}"
+    info "remote   $REMOTE_WP"
+    info "uploads  $REMOTE_UPLOADS"
+    info "mirror   $LOCAL_UPLOADS"
+    if [ "$UPLOADS_GUESSED" -eq 1 ]; then
+        warn "remote uploads sit outside $REMOTE_WP, so the mirror path is a guess"
+        warn "check LOCAL_UPLOADS in $CONF before the first sync"
+    fi
+    printf '\n'
+}
+
+# One authenticated connection for the whole run — the passphrase, if the
+# keychain does not supply it, gets asked for once rather than three times.
+SSH_OPTS=(-o ControlMaster=auto -o ControlPath="$HOME/.ssh/cm-%C" -o ControlPersist=120)
+
+if [ "$SETUP" -eq 1 ] || [ ! -r "$CONF" ]; then
+    setup_site
+else
+    # shellcheck disable=SC1090
+    . "$CONF"
+fi
+
+: "${SSH_HOST:?$CONF is missing SSH_HOST}"
+: "${REMOTE_WP:?$CONF is missing REMOTE_WP}"
+: "${REMOTE_UPLOADS:?$CONF is missing REMOTE_UPLOADS}"
+: "${REMOTE_WP_BIN:=wp}"
+LOCAL_SQL="$SITE_DIR/sql"
+
+# ── paths for this run ──────────────────────────────────────────────────────
+SITE_BACKUPS="$DEST_DIR/$SITE"
+NAME="$SITE-db-$STAMP${LABEL:+-$LABEL}"
+DB_GZ="$SITE_BACKUPS/$NAME.sql.gz"
+DB_SQL="$LOCAL_SQL/$NAME.sql"
+UP_TAR="$SITE_BACKUPS/$SITE-uploads-$STAMP.tar.zst"
+MIRRORED="$CONF_DIR/$SITE.mirrored"
+
+trap 'rm -f "$DB_GZ.part" "$DB_SQL.part" "$UP_TAR.part"' EXIT
+
+printf '%s%s%s  %s%s → %s%s\n\n' \
+    "$B" "$SITE" "$RST" "$DIM" "$SSH_HOST" "$BACKUP_ROOT" "$RST"
+if [ "$DRY" -eq 1 ]; then warn "dry run — nothing will be written or transferred"; fi
+
+# ── 1. database ─────────────────────────────────────────────────────────────
+# The DB goes first: a wrong path or a missing wp-cli fails in seconds instead
+# of after the uploads transfer. gzip runs on the server, so what crosses the
+# wire is already compressed ~10:1.
+if [ "$DO_DB" -eq 1 ]; then
+    step "Database${LABEL:+ ($LABEL)}"
+
+    if [ "$DRY" -eq 1 ]; then
+        info "would write $DB_GZ"
+        info "would write $DB_SQL"
+    else
+        mkdir -p "$SITE_BACKUPS" "$LOCAL_SQL"
+
+        # The printf %q calls deliberately expand here, on the client, to build
+        # a safely quoted command string for the remote shell.
+        # shellcheck disable=SC2029
+        ssh "${SSH_OPTS[@]}" "$SSH_HOST" \
+            "cd $(printf %q "$REMOTE_WP") && $(printf %q "$REMOTE_WP_BIN") db export - \
+                --single-transaction --quick --default-character-set=utf8mb4 \
+                --skip-plugins --skip-themes | gzip -6" > "$DB_GZ.part"
+
+        gzip -t "$DB_GZ.part" || die "the dump did not survive the trip (bad gzip)"
+        gunzip -c "$DB_GZ.part" > "$DB_SQL.part"
+
+        # Judge the SQL, not the gzip: a well-compressed dump can be tiny.
+        size=$(wc -c < "$DB_SQL.part" | tr -d '[:space:]')
+        [ "$size" -gt 4096 ] || die "only $size bytes of SQL came back — treating that as a failure"
+        tail -c 512 "$DB_SQL.part" | grep -q "Dump completed" \
+            || warn "no \"Dump completed\" marker — the dump may be truncated"
+
+        mv "$DB_GZ.part" "$DB_GZ"
+        mv "$DB_SQL.part" "$DB_SQL"
+        ln -sf "$(basename "$DB_SQL")" "$LOCAL_SQL/latest.sql"
+
+        info "$(du -h "$DB_GZ" | cut -f1)  $DB_GZ"
+        info "import with: ${B}wp db import sql/latest.sql${RST}"
+    fi
+fi
+
+# ── 2. uploads ──────────────────────────────────────────────────────────────
+if [ "$DO_UP" -eq 1 ]; then
+    step "Uploads"
+    mkdir -p "$LOCAL_UPLOADS"
+
+    # The comma in --info=stats1,del is rsync's own syntax, not an array
+    # separator: it stays inside one element. shellcheck cannot tell.
+    # shellcheck disable=SC2054
+    RSYNC_ARGS=(-a --delete --partial --human-readable --info=stats1,del
+        --exclude 'cache/'
+        --exclude '.DS_Store'
+        -e "ssh ${SSH_OPTS[*]}")
+
+    # An exact mirror deletes local-only files, which is what a backup wants
+    # but not what you want to discover the first time you point this at a
+    # project that has dev media in it. Confirm once, then never again.
+    if [ ! -e "$MIRRORED" ] && [ "$FORCE" -eq 0 ] && [ "$DRY" -eq 0 ] \
+       && [ -n "$(ls -A "$LOCAL_UPLOADS" 2>/dev/null)" ]; then
+        doomed=$("$RSYNC" -n "${RSYNC_ARGS[@]}" \
+                    "$SSH_HOST:$REMOTE_UPLOADS/" "$LOCAL_UPLOADS/" \
+                 | grep -c '^deleting ' || true)
+        if [ "$doomed" -gt 0 ]; then
+            warn "first mirror of $LOCAL_UPLOADS would delete $doomed local file(s) not on production"
+            have_tty || die "no terminal to confirm on. List them with \`backup-wp $SITE uploads -n\`, then pass --force to accept the deletions."
+            read -r -p "    continue? [y/N] " ok </dev/tty
+            case "$ok" in
+                [yY]*) ;;
+                *) die "stopped, nothing deleted. List them with \`backup-wp $SITE uploads -n\`." ;;
+            esac
+        fi
+    fi
+
+    if [ "$DRY" -eq 1 ]; then RSYNC_ARGS+=(-n); fi
+    "$RSYNC" "${RSYNC_ARGS[@]}" "$SSH_HOST:$REMOTE_UPLOADS/" "$LOCAL_UPLOADS/"
+    if [ "$DRY" -eq 0 ]; then : > "$MIRRORED"; fi
+
+    if [ "$ARCHIVE" -eq 1 ]; then
+        step "Archive"
+        if [ "$DRY" -eq 1 ]; then
+            info "would write $UP_TAR"
+        else
+            mkdir -p "$SITE_BACKUPS"
+            tar -C "$(dirname "$LOCAL_UPLOADS")" -cf - "$(basename "$LOCAL_UPLOADS")" \
+                | zstd -3 -T0 -q -f -o "$UP_TAR.part"
+            zstd -t "$UP_TAR.part" 2>/dev/null || die "archive failed verification"
+            mv "$UP_TAR.part" "$UP_TAR"
+            info "$(du -h "$UP_TAR" | cut -f1)  $UP_TAR"
+        fi
+    fi
+fi
+
+# ── 3. prune ────────────────────────────────────────────────────────────────
+# Timestamps lead the filename, so a reverse sort is newest-first.
+#
+# The depth bounds are the safety rail: retention is confined to the exact
+# level this script writes to, so anything filed elsewhere under the backup
+# root — a manual export, a keep/ folder, an old dump — is invisible to it
+# even when the name matches.
+prune() {
+    local dir="$1" pattern="$2" keep="$3" mind="$4" maxd="$5"
+    [ -d "$dir" ] || return 0
+    find "$dir" -mindepth "$mind" -maxdepth "$maxd" -type f -name "$pattern" \
+        2>/dev/null | sort -r | tail -n "+$((keep + 1))" |
+        while IFS= read -r old; do
+            if [ "$DRY" -eq 1 ]; then
+                info "would prune $(basename "$old")"
+            else
+                rm -f -- "$old"
+                info "pruned $(basename "$old")"
+            fi
+        done
+}
+
+if [ "$PRUNE" -eq 1 ]; then
+    # 4 == <root>/<year>/<month>/<site>/<file>; 1 == straight inside sql/
+    if [ "$DO_DB" -eq 1 ]; then
+        prune "$BACKUP_ROOT" "$SITE-db-*.sql.gz" "$KEEP"     4 4
+        prune "$LOCAL_SQL"   "$SITE-db-*.sql"    "$KEEP_SQL" 1 1
+    fi
+    if [ "$ARCHIVE" -eq 1 ]; then
+        prune "$BACKUP_ROOT" "$SITE-uploads-*.tar.zst" "$KEEP" 4 4
+    fi
+fi
+
+trap - EXIT
+printf '\n%s✓%s %s @ %s\n' "$GRN" "$RST" "$SITE" "$STAMP"

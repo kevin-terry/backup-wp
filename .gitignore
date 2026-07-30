@@ -1,0 +1,10 @@
+# Never commit per-site configs — they hold remote usernames and paths.
+# They live in ~/.config/backup-wp/ by default, but guard against copies here.
+*.conf
+*.mirrored
+
+# Test scratch
+test/tmp/
+
+# OS
+.DS_Store
