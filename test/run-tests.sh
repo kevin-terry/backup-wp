@@ -29,6 +29,14 @@ assert_has()     { case "$OUT" in *"$1"*) ok "$2" ;; *) bad "$2 (output lacked '
 assert_file()    { if [ -f "$1" ]; then ok "$2"; else bad "$2 (missing: $1)"; fi; }
 assert_dir()     { if [ -d "$1" ]; then ok "$2"; else bad "$2 (missing dir: $1)"; fi; }
 assert_eq()      { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1', wanted '$2')"; fi; }
+assert_gone()    { if [ -e "$1" ]; then bad "$2 (it exists: $1)"; else ok "$2"; fi; }
+
+# `stat` takes different flags on macOS and GNU and CI runs both, so read the
+# mode off `ls` instead — the one spelling both agree on. shellcheck's advice
+# to use find is about globbing a directory; this is one named file, quoted,
+# and find has no portable way to print a mode (-printf is GNU only).
+# shellcheck disable=SC2012
+modestr() { ls -ld "$1" 2>/dev/null | cut -c1-10; }
 
 # ── hermetic environment ────────────────────────────────────────────────────
 # Deliberately outside the repo: the script derives the site name from the git
@@ -100,6 +108,11 @@ case "$last" in
         echo "up-to-date,active,3.0,none,"
         echo "$premium"
         echo "mu-plugins,must-use,1.0,none,"
+        # A slug with a dot in it, for the test that a slug is matched as a
+        # name and not as a regular expression.
+        if [ -n "${STUB_DOTTED_PLUGIN:-}" ]; then
+            echo "wp.rocket,active,1.0,available,1.1"
+        fi
         exit 0 ;;
     *"plugin update"*)
         echo "Plugin updated successfully."
@@ -128,6 +141,7 @@ write_ssh_stub
 # honours --backup-dir by moving local-only files there the way real rsync does.
 cat > "$STUB/rsync" <<'EOS'
 #!/usr/bin/env bash
+if [ -n "${STUB_RSYNC_LOG:-}" ]; then printf '%s\n' "$*" >> "$STUB_RSYNC_LOG"; fi
 dry=0; backup_dir=""
 for a in "$@"; do
     [ "$a" = "-n" ] && dry=1
@@ -157,8 +171,13 @@ EOS
 chmod +x "$STUB/rsync"
 
 run() {   # run <args...> — sandboxed; override RUN_DIR / STUB_WP / STUB_UPLOADS
+    # RUN_HOME exists so a test can point $HOME somewhere disposable. The only
+    # tests that need it are the ones checking that the mirror refuses to run
+    # over a home directory — if that guard ever regresses, the damage has to
+    # land in the temp tree and not in the home directory of whoever ran this.
     OUT="$(cd "${RUN_DIR:-$SITE_DIR}" && env \
         PATH="$STUB:$PATH" \
+        HOME="${RUN_HOME:-$HOME}" \
         XDG_CONFIG_HOME="$CONFIG" \
         SITES_DIR="$SITES" \
         BACKUP_ROOT="$BACKUPS" \
@@ -169,13 +188,16 @@ run() {   # run <args...> — sandboxed; override RUN_DIR / STUB_WP / STUB_UPLOA
         STUB_UPLOADS="${STUB_UPLOADS:-$WANT_UPLOADS}" \
         STUB_UPDATE_LOG="$TMP/updated.log" \
         STUB_CTX_LOG="$TMP/context.log" \
+        STUB_RSYNC_LOG="${STUB_RSYNC_LOG:-}" \
         STUB_ADMIN_FAILS="${STUB_ADMIN_FAILS:-}" \
+        STUB_DOTTED_PLUGIN="${STUB_DOTTED_PLUGIN:-}" \
         bash "$SCRIPT" "$@" 2>&1)"
     RC=$?
     # A `VAR=x run ...` prefix on a *function* persists after the call in bash,
     # unlike on an external command. Clear the overrides so each call is
     # independent and one test cannot silently reconfigure the next.
-    unset RUN_DIR STUB_WP STUB_UPLOADS KEEP KEEP_SQL STUB_ADMIN_FAILS
+    unset RUN_DIR RUN_HOME STUB_WP STUB_UPLOADS KEEP KEEP_SQL STUB_ADMIN_FAILS
+    unset STUB_RSYNC_LOG STUB_DOTTED_PLUGIN
 }
 
 # read a value out of the generated config without sourcing it
@@ -561,6 +583,157 @@ done
 KEEP=2 run db --no-prune
 assert_rc 0 "--no-prune succeeds"
 assert_file "$DEST/$SITE-db-20200101-000000.sql.gz" "--no-prune spares the oldest"
+
+# ── what it refuses ─────────────────────────────────────────────────────────
+# Discovery believes what the server tells it, and the uploads path it hears
+# back is wp_upload_dir()'s basedir — which WordPress reads from the
+# `upload_path` option, a row in the database. On a site that has been got at,
+# that string is the attacker's to write, and it used to be copied verbatim
+# into a config file this script sources on every later run.
+group "trust boundaries"
+
+HOSTILE="$SITES/hostile-site"
+mkdir -p "$HOSTILE/public_html/uploads"
+: > "$HOSTILE/wp-cli.yml"
+HOSTILE_CONF="$CONFIG/backup-wp/hostile-site.conf"
+
+PWNED="$TMP/pwned-by-server"
+rm -f "$PWNED"
+RUN_DIR="$HOSTILE" STUB_WP="/home/user/wp" \
+    STUB_UPLOADS="/home/user/wp/uploads\"; touch \"$PWNED\"; :\"" \
+    run db --host stub-host
+assert_rc 1 "refuses a remote path that would break out of the config file"
+assert_gone "$HOSTILE_CONF" "...writing no config at all"
+# The payload fires when the config is sourced, so run again without --host:
+# whatever setup left behind is what a later run would read.
+RUN_DIR="$HOSTILE" run db
+assert_gone "$PWNED" "...so nothing the server sent ever runs on this machine"
+
+# The same answer aimed at the mirror instead: `..` in the remote uploads path
+# is subtracted from the local one, which would point `rsync --delete` at some
+# ancestor of the project.
+RUN_DIR="$HOSTILE" STUB_WP="/home/user/wp" \
+    STUB_UPLOADS="/home/user/wp/wp-content/uploads/../../../../.." \
+    run uploads --host stub-host
+assert_rc 1 "refuses a remote uploads path that climbs out with .."
+# Assert the reason too: without a terminal this run stops at the first-mirror
+# confirmation anyway, and would otherwise look like a pass on either code.
+assert_has "will not put in a shell command" "...for that reason and not the prompt"
+assert_gone "$HOSTILE_CONF" "...writing no config for it either"
+
+# ssh and rsync both read a leading dash as an option, and -oProxyCommand runs
+# a command of the caller's choosing.
+RUN_DIR="$HOSTILE" run db --host "-oProxyCommand=touch $TMP/proxied"
+assert_rc 1 "refuses an ssh host that ssh would read as an option"
+assert_has "not a usable ssh target" "...saying what it wanted instead"
+
+# Local paths get no allowlist — a directory on this machine may legitimately
+# be called anything — so they have to come back out of the config intact.
+# shellcheck disable=SC2016  # not expanding here is the entire point: these
+# have to reach the config as literal characters in a directory name
+ODD='odd $(id) "site" `hostname`'
+mkdir -p "$SITES/$ODD"
+: > "$SITES/$ODD/wp-cli.yml"
+run "$ODD" db --host stub-host
+assert_rc 0 "sets up a project whose path is full of shell metacharacters"
+ODD_BACK="$(bash -c '. "$1"; printf %s "$SITE_DIR"' _ "$CONFIG/backup-wp/$ODD.conf" 2>/dev/null)"
+assert_eq "$ODD_BACK" "$SITES/$ODD" "...and that path survives the config unchanged"
+
+# The site key is a filename in the config directory and the leading half of
+# every retention pattern: `*` there widens `find -name` until it matches other
+# sites' snapshots, and `..` writes the config outside the config directory.
+mkdir -p "$SITES/"'*' "$TMP/outside"
+run '*' db
+assert_rc 1 "a site key of * is refused"
+assert_has "cannot contain" "...naming the characters it will not take"
+run ../outside db --host stub-host   # --host, or it stops at the setup prompt
+assert_rc 1 "a site key that walks up out of the config directory is refused"
+assert_gone "$CONFIG/backup-wp/../outside.conf" "...leaving nothing behind where it pointed"
+
+# A config written before any of these checks existed has never been vetted.
+# Sourcing it has already happened by the time we look, but the rsync it aims
+# is still ours to refuse.
+cat > "$CONFIG/backup-wp/legacy.conf" <<EOF
+SITE_DIR="$SITE_DIR"
+SSH_HOST="stub-host"
+REMOTE_WP="/home/user/wp"
+REMOTE_UPLOADS="/home/user/wp/uploads/../../.."
+LOCAL_UPLOADS="$UPLOADS"
+EOF
+run legacy uploads
+assert_rc 1 "refuses a stale config whose remote path climbs out"
+assert_has "will not put in a shell command" "...before it gets anywhere near rsync"
+
+# The mirror is the one command here that deletes, so its destination is
+# checked rather than trusted.
+sed 's|^REMOTE_UPLOADS=.*|REMOTE_UPLOADS="/home/user/wp/uploads"|; s|^LOCAL_UPLOADS=.*|LOCAL_UPLOADS=""|' \
+    "$CONFIG/backup-wp/legacy.conf" > "$CONFIG/backup-wp/nodest.conf"
+run nodest uploads
+assert_rc 1 "refuses to mirror when the config names no destination"
+assert_has "no destination" "...saying which setting is missing"
+
+mkdir -p "$TMP/fakehome"
+sed "s|^LOCAL_UPLOADS=.*|LOCAL_UPLOADS=\"$TMP/fakehome\"|" \
+    "$CONFIG/backup-wp/nodest.conf" > "$CONFIG/backup-wp/homedest.conf"
+RUN_HOME="$TMP/fakehome" run homedest uploads
+assert_rc 1 "refuses to mirror straight over a home directory"
+
+# A symlink arriving from the server that points out of the tree is dropped,
+# not recreated here. wp-content/uploads is the most routinely compromised
+# corner of a WordPress site and this is a pull onto a laptop.
+: > "$TMP/rsync-args.log"
+STUB_RSYNC_LOG="$TMP/rsync-args.log" run uploads --force
+if grep -q -- '--safe-links' "$TMP/rsync-args.log"; then
+    ok "the mirror will not follow a symlink out of the uploads tree"
+else
+    bad "the mirror will not follow a symlink out of the uploads tree"
+fi
+
+# ── file modes ──────────────────────────────────────────────────────────────
+group "what the dump is readable by"
+
+# A dump is every password hash, email address and API key the site holds. The
+# default umask would hand it to anyone else with an account on this machine,
+# and the .part it is assembled in has an entirely predictable name.
+run db
+LAST_GZ="$(find "$DEST" -maxdepth 1 -type f -name "$SITE-db-*.sql.gz" | sort | tail -1)"
+assert_eq "$(modestr "$LAST_GZ")" "-rw-------" "the compressed dump is readable only by its owner"
+assert_eq "$(modestr "$SQL_DIR/$(basename "$LAST_GZ" .sql.gz).sql")" "-rw-------" \
+          "...and so is the plain .sql beside the project"
+assert_eq "$(modestr "$CONF")" "-rw-------" "the config is private"
+assert_eq "$(modestr "$CONFIG/backup-wp")" "drwx------" "...as is the directory holding every site's"
+
+# The mirror is the deliberate exception: it is public website media, and a
+# local web server may need to read it.
+FRESH="$SITES/fresh-mirror"
+mkdir -p "$FRESH/public_html"
+: > "$FRESH/wp-cli.yml"
+( umask 022
+  RUN_DIR="$FRESH" STUB_WP="/home/user/fresh" \
+      STUB_UPLOADS="/home/user/fresh/public_html/uploads" \
+      run uploads --host stub-host --force )
+assert_eq "$(modestr "$FRESH/public_html/uploads")" "drwxr-xr-x" \
+          "the mirror keeps the umask you already had"
+
+# ── plugin names are names, not patterns ────────────────────────────────────
+group "plugin name matching"
+
+# `.` is legal in a plugin directory name. Matched as a regular expression,
+# `wp.rocket` matches the Composer package `wp-rocket` — so a server-managed
+# plugin gets filed as Composer's and is then never updated.
+cp "$SITE_DIR/composer.json" "$TMP/composer.json.keep"
+cat > "$SITE_DIR/composer.json" <<'EOS'
+{ "require": { "wpackagist-plugin/wp-rocket": "^3.0" } }
+EOS
+: > "$TMP/updated.log"
+STUB_DOTTED_PLUGIN=1 run plugins --update
+assert_rc 0 "a plugin whose slug holds a dot is handled"
+if grep -Fqx 'wp.rocket' "$TMP/updated.log"; then
+    ok "...and is not mistaken for the Composer package it resembles"
+else
+    bad "...and is not mistaken for the Composer package it resembles"
+fi
+mv "$TMP/composer.json.keep" "$SITE_DIR/composer.json"
 
 # ── result ──────────────────────────────────────────────────────────────────
 printf '\n%s%d passed%s' "$GRN" "$PASS" "$RST"

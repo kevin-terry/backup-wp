@@ -21,6 +21,13 @@
 
 set -euo pipefail
 
+# A dump is every password hash, email address and API key the site holds, and
+# the .part it is built in has a predictable name. Neither should be readable
+# by anyone else on this machine. The uploads mirror is the one exception, and
+# says so where it is created.
+UMASK_WAS="$(umask)"
+umask 077
+
 # ── settings ────────────────────────────────────────────────────────────────
 SITES_DIR="${SITES_DIR:-$HOME/Sites}"
 BACKUP_ROOT="${BACKUP_ROOT:-$HOME/Site Backups}"
@@ -50,6 +57,48 @@ step() { printf '%s==>%s %s\n' "$B" "$RST" "$*"; }
 info() { printf '    %s%s%s\n' "$DIM" "$*" "$RST"; }
 warn() { printf '%s !! %s%s\n' "$YEL" "$*" "$RST" >&2; }
 die()  { printf '%serror:%s %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
+
+# ── what this accepts from elsewhere ────────────────────────────────────────
+# The uploads path discovery gets back is `wp_upload_dir()`'s basedir, which
+# WordPress reads from the `upload_path` option — a row in the database. On a
+# compromised site an attacker writes that string, and it lands in a config
+# file this script sources. So it is checked before it is written, not after.
+
+# Absolute, no `..`, and nothing a shell or a glob acts on: the value has to
+# survive the config file, the ssh command string, and rsync's remote argument,
+# which the server's login shell expands a second time.
+safe_remote_path() {
+    case "$1" in
+        /*) ;;
+        *)  return 1 ;;
+    esac
+    case "$1" in
+        *[!A-Za-z0-9._/@+:,=%-]*) return 1 ;;
+        ..|../*|*/..|*/../*)      return 1 ;;
+    esac
+    return 0
+}
+
+# A leading dash makes ssh and rsync read the host as an option instead, and
+# -oProxyCommand=... runs a command of its own choosing.
+safe_ssh_host() {
+    case "$1" in
+        ''|-*)                return 1 ;;
+        *[!A-Za-z0-9._@%:-]*) return 1 ;;
+    esac
+    return 0
+}
+
+# Escape a value for the KEY="value" form the config uses. Inside double quotes
+# a shell treats only these four characters specially, so that is the whole job.
+conf_quote() {
+    local v="$1"
+    v="${v//\\/\\\\}"          # backslashes first, or they escape the escapes
+    v="${v//\"/\\\"}"
+    v="${v//\$/\\\$}"
+    v="${v//\`/\\\`}"
+    printf '%s' "$v"
+}
 
 usage() {
     cat <<'EOF'
@@ -179,6 +228,17 @@ else
     die "no site \"$SITE\" in $SITES_DIR and no config for it. Run: backup-wp $SITE --setup"
 fi
 
+# The site key becomes a filename in the config directory and the leading half
+# of every retention pattern: a `/` writes the config elsewhere entirely, and a
+# `*` widens `find -name "$SITE-db-*.sql.gz"` onto other sites' snapshots.
+# Spaces and accents are fine — every use of it is quoted.
+case "$SITE" in
+    ''|.|..)                           die "\"$SITE\" is not a usable site name" ;;
+    -*)                                die "a site name cannot start with a dash: $SITE" ;;
+    */*|*'*'*|*'?'*|*'['*|*']'*|*\\*)  die "a site name cannot contain / * ? [ ] or \\: $SITE" ;;
+    *[[:cntrl:]]*)                     die "a site name cannot contain control characters" ;;
+esac
+
 CONF="$CONF_DIR/$SITE.conf"
 
 # ── first run: ask once, discover the rest, never ask again ─────────────────
@@ -267,6 +327,8 @@ setup_site() {
         have_tty || die "no config for $SITE. Run it in a terminal, or pass --host <ssh-alias>."
         SSH_HOST="$(pick_ssh_host)"
     fi
+    safe_ssh_host "$SSH_HOST" \
+        || die "\"$SSH_HOST\" is not a usable ssh target — give an ~/.ssh/config alias or user@host"
 
     step "Checking $SSH_HOST"
     ssh "${SSH_OPTS[@]}" "$SSH_HOST" true || die "cannot reach $SSH_HOST over ssh"
@@ -279,16 +341,33 @@ setup_site() {
     # at the project root with wp-cli.yml, once at the docroot below it. Both
     # report the same uploads dir, so keep only the first hit per uploads dir;
     # the remote sorts its output, which puts the parent ahead of the child.
-    local -a found=() seen=()
-    local line up
+    #
+    # Candidates that fail safe_remote_path drop out here rather than at the
+    # end, so one oddly named install does not block setting up a sound one.
+    local -a found=() seen=() rejected=()
+    local line dir up rej
     while IFS= read -r line; do
         case "$line" in OK$'\t'*) ;; *) continue ;; esac
+        dir="$(cut -f3 <<<"$line")"
         up="$(cut -f4 <<<"$line")"
+        if ! safe_remote_path "$dir" || ! safe_remote_path "$up"; then
+            rejected+=("$dir → $up")
+            continue
+        fi
         case " ${seen[*]-} " in *" $up "*) continue ;; esac
         seen+=("$up")
         found+=("$line")
     done <<<"$out"
-    [ ${#found[@]} -gt 0 ] || die "found no working WordPress install under \$HOME on $SSH_HOST"
+    if [ ${#found[@]} -eq 0 ]; then
+        if [ ${#rejected[@]} -gt 0 ]; then
+            for rej in "${rejected[@]}"; do warn "refused: $rej"; done
+            die "$(printf 'every install found has a path this script will not put in a shell command.\n       Write %s by hand if those really are the paths.' "$CONF")"
+        fi
+        die "found no working WordPress install under \$HOME on $SSH_HOST"
+    fi
+    if [ ${#rejected[@]} -gt 0 ]; then
+        warn "ignored ${#rejected[@]} install(s) whose paths hold characters a shell would act on"
+    fi
 
     local choice
     if [ ${#found[@]} -eq 1 ]; then
@@ -342,16 +421,19 @@ setup_site() {
             LOCAL_UPLOADS="${LOCAL_UPLOADS:-$SITE_DIR/uploads}" ;;
     esac
 
+    # Everything is escaped on the way in. The remote values passed
+    # safe_remote_path already; the local ones never do — a directory here may
+    # legitimately be called anything, and this file gets sourced.
     mkdir -p "$CONF_DIR"
     cat > "$CONF" <<EOF
 # backup-wp — $SITE
 # discovered $(date '+%Y-%m-%d %H:%M'). Delete this file or run --setup to redo.
-SITE_DIR="$SITE_DIR"
-SSH_HOST="$SSH_HOST"
-REMOTE_WP="$REMOTE_WP"
-REMOTE_WP_BIN="$REMOTE_WP_BIN"
-REMOTE_UPLOADS="$REMOTE_UPLOADS"
-LOCAL_UPLOADS="$LOCAL_UPLOADS"
+SITE_DIR="$(conf_quote "$SITE_DIR")"
+SSH_HOST="$(conf_quote "$SSH_HOST")"
+REMOTE_WP="$(conf_quote "$REMOTE_WP")"
+REMOTE_WP_BIN="$(conf_quote "$REMOTE_WP_BIN")"
+REMOTE_UPLOADS="$(conf_quote "$REMOTE_UPLOADS")"
+LOCAL_UPLOADS="$(conf_quote "$LOCAL_UPLOADS")"
 EOF
 
     step "Saved ${DIM}$CONF${RST}"
@@ -379,7 +461,18 @@ fi
 : "${SSH_HOST:?$CONF is missing SSH_HOST}"
 : "${REMOTE_WP:?$CONF is missing REMOTE_WP}"
 : "${REMOTE_UPLOADS:?$CONF is missing REMOTE_UPLOADS}"
+: "${SITE_DIR:?$CONF is missing SITE_DIR}"
 : "${REMOTE_WP_BIN:=wp}"
+
+# Sourcing has already happened by the time we get here, so this cannot stop
+# code hiding in the file — only stop a bad value reaching ssh or rsync, which
+# is the half that costs data. Configs written before these checks existed have
+# never been vetted at all. REMOTE_WP_BIN is exempt: `printf %q` covers both of
+# its uses, and it defaults to the bare word `wp`.
+safe_ssh_host "$SSH_HOST"          || die "$CONF has an SSH_HOST that ssh would read as an option or a pattern: $SSH_HOST"
+safe_remote_path "$REMOTE_WP"      || die "$CONF has a REMOTE_WP this script will not put in a shell command: $REMOTE_WP"
+safe_remote_path "$REMOTE_UPLOADS" || die "$CONF has a REMOTE_UPLOADS this script will not put in a shell command: $REMOTE_UPLOADS"
+
 LOCAL_SQL="$SITE_DIR/sql"
 
 # ── paths for this run ──────────────────────────────────────────────────────
@@ -438,12 +531,29 @@ fi
 # ── 2. uploads ──────────────────────────────────────────────────────────────
 if [ "$DO_UP" -eq 1 ]; then
     step "Uploads"
-    mkdir -p "$LOCAL_UPLOADS"
+
+    # The one command here that deletes, so its destination is checked rather
+    # than trusted: an empty or hand-edited LOCAL_UPLOADS would aim
+    # `rsync --delete` at a whole home directory.
+    case "${LOCAL_UPLOADS:-}" in
+        '')                  die "$CONF sets no LOCAL_UPLOADS, so the mirror has no destination" ;;
+        ..|../*|*/..|*/../*) die "LOCAL_UPLOADS must not climb with \"..\" — fix it in $CONF" ;;
+        /|"$HOME"|"$HOME"/)  die "refusing to mirror over $LOCAL_UPLOADS — fix LOCAL_UPLOADS in $CONF" ;;
+        /*)                  ;;
+        *)                   die "LOCAL_UPLOADS must be an absolute path — fix it in $CONF" ;;
+    esac
+
+    # Public website media a local web server may need to read: the one thing
+    # created with the caller's umask, not the private one set at the top.
+    ( umask "$UMASK_WAS"; mkdir -p "$LOCAL_UPLOADS" )
 
     # The comma in --info=stats1,del is rsync's own syntax, not an array
     # separator: it stays inside one element. shellcheck cannot tell.
+    #
+    # --safe-links drops symlinks arriving from the server that point out of
+    # the tree: uploads is the most routinely compromised part of a WP site.
     # shellcheck disable=SC2054
-    RSYNC_ARGS=(-a --delete --partial --human-readable --info=stats1,del
+    RSYNC_ARGS=(-a --delete --safe-links --partial --human-readable --info=stats1,del
         --exclude 'cache/'
         --exclude '.DS_Store'
         -e "ssh ${SSH_OPTS[*]}")
@@ -584,13 +694,16 @@ foreach (array_merge(array_keys($r), array_keys($n)) as $f) { echo dirname($f), 
         case "$status" in must-use|dropin) continue ;; esac
         if [ "$update" != "available" ]; then
             # Server-managed and never heard from: a human has to go and look.
-            if ! printf '%s\n' "$owned" | grep -qx "$name" \
-               && ! printf '%s\n' "$known" | grep -qx "$name"; then
+            if ! printf '%s\n' "$owned" | grep -Fqx "$name" \
+               && ! printf '%s\n' "$known" | grep -Fqx "$name"; then
                 silent="$silent $name:$version"
             fi
             continue
         fi
-        if printf '%s\n' "$owned" | grep -qx "$name"; then
+        # -F throughout: a plugin slug is a directory name, not a pattern, and
+        # `.` is legal in one. Without it `wp.rocket` matches `wp-rocket` and a
+        # server-managed plugin is quietly filed as Composer's and never updated.
+        if printf '%s\n' "$owned" | grep -Fqx "$name"; then
             printf '    %-26s %-9s → %-9s %scomposer%s\n' \
                 "$name" "$version" "$next" "$DIM" "$RST"
             theirs=$((theirs + 1))
@@ -634,7 +747,7 @@ EOF
         for want in $(printf '%s' "$ONLY" | tr ',' ' '); do
             if in_list "$want" "$updatable"; then
                 chosen="$chosen $want"
-            elif printf '%s\n' "$owned" | grep -qx "$want"; then
+            elif printf '%s\n' "$owned" | grep -Fqx "$want"; then
                 die "$want is Composer-managed — update it with \`composer update\` locally, or the next deploy reverts it"
             elif in_list "$want" "$(printf '%s' "$silent" | tr ':' ' ')"; then
                 die "$want reports no updater, so there is no update to fetch — update it by hand"

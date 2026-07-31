@@ -1,10 +1,11 @@
 # backup-wp
 
-Pull a WordPress site's database and uploads down from production over SSH.
+Quickly pull down and archive WordPress databases and uploads over SSH.
 
 ```bash
-backup-wp pre     # database snapshot, before you deploy
-backup-wp post    # database snapshot + uploads mirror, after
+backup-wp          # database snapshot + uploads mirror, untagged
+backup-wp pre      # database snapshot only, tagged "pre"
+backup-wp post     # database snapshot + uploads mirror, tagged "post"
 ```
 
 Backups never write to the server. The database streams out of `wp-cli`; the
@@ -12,7 +13,7 @@ uploads come down as an rsync delta, so repeat runs only move what changed.
 
 ## Requirements
 
-- **Local:** `bash`, `rsync`, `gzip`, `tar`, `zstd`, an SSH key into the server.
+- **Local:** `bash`, `rsync`, `gzip`, `tar`, `zstd`, configured SSH key.
 - **Remote:** `wp-cli` on the `PATH` and `mysqldump`.
 
 Works on most hosts with SSH access. Untested on managed hosts like WP Engine.
@@ -53,16 +54,17 @@ Skip the question with `backup-wp --host example-prod`.
 ## Commands
 
 ```bash
+backup-wp                      # DB + uploads mirror (the default)
 backup-wp pre                  # DB only, tagged "pre"
-backup-wp post                 # DB tagged "post" + uploads mirror
-backup-wp db                   # DB only, untagged
+backup-wp post                 # DB + uploads mirror, tagged "post"
+backup-wp db                   # DB only
 backup-wp uploads              # uploads only
-backup-wp plugins              # list pending plugin updates
-backup-wp plugins --update     # apply the server-managed ones
-backup-wp                      # DB + uploads (the default)
+backup-wp uploads --archive    # uploads + a .tar.zst archieve of uploads
+backup-wp plugins              # lists pending plugin updates on remote
+backup-wp plugins --update     # applys the remote server-managed updates
 ```
 
-The site comes from the directory you're in. Name it to work from anywhere:
+TIP: The site comes from the directory you're in. To work from anywhere add the site name:
 `backup-wp example-site pre`.
 
 | Flag             | Effect                                                  |
@@ -93,6 +95,13 @@ The site comes from the directory you're in. Name it to work from anywhere:
 
 Import with `wp db import sql/latest.sql`.
 
+A dump holds every password hash, email address and API key on the site, so
+everything written here — dumps, archives and the config — is created readable
+only by you. The uploads mirror is the exception: it's public media, and a
+local web server may need to read it, so it keeps your usual umask. Backups
+taken before this was true keep the permissions they were made with; `chmod`
+them if the machine has other accounts on it.
+
 Docroot names are never assumed — `public_html`, `httpdocs`, `htdocs`, `web`
 all work untouched. WordPress is found by its marker files and the uploads path
 comes from `wp_upload_dir()`.
@@ -103,6 +112,8 @@ comes from `wp_upload_dir()`.
   production doesn't have. They're moved to `rescued-<stamp>/` first, with
   paths preserved, not deleted. `--no-rescue` opts out. The first mirror into a
   non-empty folder asks before proceeding; `--dry-run` shows the list.
+  Symlinks arriving from the server that point out of the uploads tree are
+  dropped rather than recreated locally.
 - **Retention is narrow.** Old snapshots trim to the newest `$KEEP` (default
   10), but only files sitting exactly at
   `<root>/<year>/<month>/<site>/<site>-db-*.sql.gz` (or `-uploads-*.tar.zst`).
@@ -139,7 +150,10 @@ database and uploads, not plugin files.
 ## Configuration
 
 Per-site answers live in `~/.config/backup-wp/<site>.conf` — plain shell
-variables, safe to edit:
+variables, safe to edit. The file is sourced, so the two remote paths are
+checked before use: each must be absolute, free of `..`, and free of anything
+a shell would act on. Set them to something else and the run stops rather than
+passing it along.
 
 ```bash
 SITE_DIR="/home/user/Sites/example-site"
@@ -172,6 +186,10 @@ Environment overrides:
   hosts sometimes retire a `HostName` while your user, key and port stay valid.
 - **`no terminal to confirm on`** — run interactively, or pass `--host` /
   `--force`.
+- **`will not put in a shell command`** — a remote path holds `..` or a
+  character a shell would act on. WordPress takes the uploads path from the
+  `upload_path` row in the database, so an unexpected one is worth a look
+  before you set `REMOTE_UPLOADS` by hand.
 
 Asked for a passphrase every run? That's ssh. On macOS:
 `ssh-add --apple-use-keychain ~/.ssh/your-key`.

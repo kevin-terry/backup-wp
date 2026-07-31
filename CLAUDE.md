@@ -41,10 +41,29 @@ Break any of these and the tool stops being trustworthy:
   matches. Widening that search is a data-loss bug.
 - **Guessing is always announced.** Where a path can't be derived, the script
   says it guessed and names the setting to correct.
+- **What the server says is input, not fact.** The uploads path discovery gets
+  back is `wp_upload_dir()`'s basedir, which WordPress reads from the
+  `upload_path` option — a row in the database. On a compromised site an
+  attacker writes that string, and it lands in a config file this script
+  *sources*. So remote paths are held to `safe_remote_path` (absolute, no `..`,
+  allowlisted characters) before they are stored, every config value is written
+  through `conf_quote`, and both checks run again on the way back in for
+  configs older than the checks. The site key gets the same treatment: it is
+  a filename in the config directory and the leading half of every retention
+  pattern, so a `*` in it would widen `find -name` onto other sites' backups.
 - **The mirror never destroys.** `rsync --backup --backup-dir` moves anything
   about to be deleted or overwritten into `rescued-<stamp>/` beside that run's
   archives. Reach for rsync's own facilities before hand-rolling: this needs no
-  extra pass and no file list to parse. `--no-rescue` opts out.
+  extra pass and no file list to parse. `--no-rescue` opts out. It is also the
+  only command here that deletes, so its destination is checked rather than
+  trusted, and `--safe-links` keeps a compromised uploads directory from
+  planting a symlink that points out of the tree.
+- **The dump is a secret.** It holds every password hash, email address and API
+  key on the site. The script runs at `umask 077` so nothing it writes — dumps,
+  archives, configs, and the predictably-named `.part` files they are assembled
+  in — is readable by anyone else on the machine. `$LOCAL_UPLOADS` is the one
+  deliberate exception (public media, and a local web server may need it), and
+  it is created in a subshell that restores the caller's umask.
 
 ## Constraints worth knowing
 
@@ -88,8 +107,9 @@ tests here were written that way and it's the only thing that proves them.
 ## Style
 
 shellcheck runs at `-S warning` in CI; the code is currently clean at `-S style`
-too. Suppressions must carry a comment saying why the warning is wrong — there
-are three, all genuine false positives.
+too, tests included. Every suppression must carry a comment saying why the
+warning is wrong; they are all genuine false positives, and a new one that
+isn't obviously in that class means the code should change instead.
 
 ## Publishing
 
