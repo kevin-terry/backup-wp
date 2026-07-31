@@ -3,9 +3,8 @@
 Quickly pull down and archive WordPress databases and uploads over SSH.
 
 ```bash
-backup-wp          # database snapshot + uploads mirror, untagged
-backup-wp pre      # database snapshot only, tagged "pre"
-backup-wp post     # database snapshot + uploads mirror, tagged "post"
+backup-wp             # database snapshot + uploads mirror
+backup-wp --archive   # database snapshot + uploads mirror + .tar.zst archive of uploads
 ```
 
 Backups never write to the server. The database streams out of `wp-cli`; the
@@ -55,12 +54,17 @@ Skip the question with `backup-wp --host example-prod`.
 
 ```bash
 backup-wp                      # DB + uploads mirror (the default)
-backup-wp pre                  # DB only, tagged "pre"
-backup-wp post                 # DB + uploads mirror + .tar.zst, tagged "post"
+backup-wp --archive            # DB + uploads mirror + .tar.zst archive of uploads
+
+backup-wp pre                  # DB only, tagged "pre" (pre update)
+backup-wp post                 # DB + uploads mirror + .tar.zst, tagged "post" (post update)
 backup-wp post --no-archive    # ...without the .tar.zst
+
 backup-wp db                   # DB only
+
 backup-wp uploads              # uploads only
-backup-wp uploads --archive    # uploads + a .tar.zst archieve of uploads
+backup-wp uploads --archive    # uploads + .tar.zst archive of uploads
+
 backup-wp plugins              # lists pending plugin updates on remote
 backup-wp plugins --update     # applys the remote server-managed updates
 ```
