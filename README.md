@@ -97,12 +97,7 @@ TIP: The site comes from the directory you're in. To work from anywhere add the 
 
 Import with `wp db import sql/latest.sql`.
 
-A dump holds every password hash, email address and API key on the site, so
-everything written here — dumps, archives and the config — is created readable
-only by you. The uploads mirror is the exception: it's public media, and a
-local web server may need to read it, so it keeps your usual umask. Backups
-taken before this was true keep the permissions they were made with; `chmod`
-them if the machine has other accounts on it.
+Database dumps are created readable only by you. The uploads mirror keeps your usual umask.
 
 Docroot names are never assumed — `public_html`, `httpdocs`, `htdocs`, `web`
 all work untouched. WordPress is found by its marker files and the uploads path
@@ -129,7 +124,7 @@ comes from `wp_upload_dir()`.
 ```bash
 backup-wp plugins                       # what has updates, and who owns each
 backup-wp plugins --update              # apply every server-managed one
-backup-wp plugins --update=some-plugin  # ...or just the one you trust
+backup-wp plugins --update=some-plugin  # ...or just the one you specify
 ```
 
 ```console
