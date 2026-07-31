@@ -131,8 +131,6 @@ comes from `wp_upload_dir()`.
 backup-wp plugins                       # what has updates, and who owns each
 backup-wp plugins --update              # apply every server-managed one
 backup-wp plugins --update=some-plugin  # ...or just the one you specify
-backup-wp plugins --hold=some-plugin    # ...adds plugin to hold list and will no longer update
-backup-wp plugins --unhold=some-plugin  # ...removes plugin from hold list allowing updates again
 ```
 
 ```console
@@ -151,14 +149,14 @@ $ backup-wp plugins
   check those by hand.
 - `held` — you've pinned it in `HOLD_PLUGINS`. See below.
 
-### Holding a plugin back
+### Holding a plugin back from updates
 
 Some plugins you never want updated in place — one that breaks a licence on
 upgrade, one a client's theme is pinned to.
 
 ```bash
-backup-wp plugins --hold=page-builder      # never update this one here
-backup-wp plugins --hold=a,b               # several at once
+backup-wp plugins --hold=page-builder      # never update this one
+backup-wp plugins --hold=a,b               # add several at once
 backup-wp plugins --unhold=page-builder    # let it update again
 ```
 
