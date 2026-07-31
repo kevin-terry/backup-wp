@@ -82,6 +82,8 @@ TIP: The site comes from the directory you're in. To work from anywhere add the 
 | `--no-rescue`    | delete outright instead of moving replaced files aside  |
 | `--update`       | with `plugins`, apply every server-managed update       |
 | `--update=a,b`   | ...or only the plugins named                            |
+| `--hold=a,b`     | never update these on this site; saved in its config    |
+| `--unhold=a,b`   | let `--update` have them again                          |
 | `--setup`        | re-run discovery and rewrite this site's config         |
 | `--host <alias>` | set up against an SSH alias without asking              |
 | `--list`         | show every configured site                              |
@@ -137,6 +139,7 @@ $ backup-wp plugins
     contact-form              1.2.0     → 1.3.1     composer
     file-manager              6.2.6     → 6.3.7     server
     some-premium-plugin       6.32                  no updater
+    page-builder              4.1.0     → 4.2.0     held
 ```
 
 - `composer` — owned by your `composer.json`; update locally and deploy.
@@ -144,6 +147,30 @@ $ backup-wp plugins
 - `server` — what `--update` acts on.
 - `no updater` — WordPress has never heard from it. Not the same as current;
   check those by hand.
+- `held` — you've pinned it in `HOLD_PLUGINS`. See below.
+
+### Holding a plugin back
+
+Some plugins you never want updated in place — one that breaks a licence on
+upgrade, one a client's theme is pinned to.
+
+```bash
+backup-wp plugins --hold=page-builder      # never update this one here
+backup-wp plugins --hold=a,b               # several at once
+backup-wp plugins --unhold=page-builder    # let it update again
+```
+
+The hold is saved to the site's config as `HOLD_PLUGINS` and applies to every
+run afterwards. Held plugins are still listed, marked `held`, so you can see
+what you're passing on; `--update` skips them, and naming one with
+`--update=page-builder` stops the run rather than quietly obeying or quietly
+ignoring you.
+
+`--hold` checks the name against the plugins actually installed on the server
+and refuses one it can't find — a misspelled hold that silently holds nothing
+is the exact failure the setting exists to prevent. You can still edit
+`HOLD_PLUGINS` by hand; `--setup` rewrites everything else in the file and
+leaves that line alone.
 
 Back up first. It's `wp plugin update` underneath, and these backups cover the
 database and uploads, not plugin files.
@@ -163,7 +190,11 @@ REMOTE_WP="/home/user/sites/example.com"
 REMOTE_WP_BIN="/usr/local/bin/wp"
 REMOTE_UPLOADS="/home/user/sites/example.com/public_html/uploads"
 LOCAL_UPLOADS="/home/user/Sites/example-site/public_html/uploads"
+HOLD_PLUGINS=""                         # plugins `--update` must never touch
 ```
+
+Everything but `HOLD_PLUGINS` is discovered and rewritten by `--setup`; that
+one is set by `--hold` / `--unhold` or by hand, and is carried across.
 
 Environment overrides:
 

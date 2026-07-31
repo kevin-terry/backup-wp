@@ -89,6 +89,18 @@ safe_ssh_host() {
     return 0
 }
 
+# A held plugin name is a plugin's directory name, and it is one of the few
+# values here a human types straight into the config. It never reaches a shell,
+# but the hold list is read by word splitting, so a `*` in it would glob against
+# the working directory and hold whatever happened to be sitting there.
+safe_plugin_slug() {
+    case "$1" in
+        ''|-*|.*)          return 1 ;;   # a leading dot or dash is not a slug
+        *[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    return 0
+}
+
 # Escape a value for the KEY="value" form the config uses. Inside double quotes
 # a shell treats only these four characters specially, so that is the whole job.
 conf_quote() {
@@ -98,6 +110,29 @@ conf_quote() {
     v="${v//\$/\\\$}"
     v="${v//\`/\\\`}"
     printf '%s' "$v"
+}
+
+# Replace HOLD_PLUGINS in an existing config, leaving every other line — the
+# comments included — exactly where the user found them. A line at a time
+# rather than sed, because the whole point is to touch nothing else in a file
+# that is about to be sourced.
+conf_set_hold() {
+    local value="$1" line found=0 tmp="$CONF.new"
+    : > "$tmp"
+    # `|| [ -n "$line" ]` so a final line with no newline is not dropped.
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            HOLD_PLUGINS=*)
+                printf 'HOLD_PLUGINS="%s"\n' "$(conf_quote "$value")" >> "$tmp"
+                found=1 ;;
+            *)  printf '%s\n' "$line" >> "$tmp" ;;
+        esac
+    done < "$CONF"
+    # Configs written before the setting existed have no line to replace.
+    if [ "$found" -eq 0 ]; then
+        printf 'HOLD_PLUGINS="%s"\n' "$(conf_quote "$value")" >> "$tmp"
+    fi
+    mv "$tmp" "$CONF" || { rm -f "$tmp"; die "could not write $CONF"; }
 }
 
 usage() {
@@ -122,6 +157,8 @@ options
       --no-rescue   delete outright instead of moving replaced files aside
       --update      with `plugins`, apply every server-managed update
       --update=a,b  ...or only the plugins named
+      --hold=a,b    never update these on this site; remembered in its config
+      --unhold=a,b  let --update have them again
       --setup       (re)run discovery for this site and rewrite its config
       --host <a>    set up against ssh alias <a> without asking (implies --setup)
       --list        list configured sites and exit
@@ -130,6 +167,10 @@ options
 Site is taken from the current project directory when omitted. Backups land in
 "~/Site Backups/<year>/<month>/<site>/"; the newest .sql is also dropped in the
 project's sql/ dir as latest.sql so it is one command to import.
+
+Plugins held with --hold are never updated. They are listed as "held" when an
+update is pending, and --update passes over them. The list lives in HOLD_PLUGINS
+in the site's config, editable by hand and kept across --setup.
 
 Retention only ever considers files sitting exactly at
 <root>/<year>/<month>/<site>/<site>-db-*.sql.gz (or -uploads-*.tar.zst).
@@ -144,7 +185,7 @@ EOF
 # ARCHIVE starts empty rather than 0 so `post` can default it to 1 below
 # without overriding an explicit --no-archive, whichever order they were given.
 SITE=""; WHAT=""; ARCHIVE=""; DRY=0; FORCE=0; PRUNE=1; SETUP=0; HOST_ARG=""
-RESCUE_ON=1; APPLY=0; ONLY=""
+RESCUE_ON=1; APPLY=0; ONLY=""; HOLD_ADD=""; HOLD_DEL=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -160,6 +201,14 @@ while [ $# -gt 0 ]; do
         --update)      APPLY=1 ;;
         --update=*)    APPLY=1; ONLY="${1#--update=}"
                        [ -n "$ONLY" ] || die "--update= needs a plugin name" ;;
+        # Accumulated rather than assigned, so repeating the flag works as well
+        # as the comma list --update= already taught.
+        --hold=*)      HOLD_ADD="$HOLD_ADD ${1#--hold=}"
+                       [ -n "${1#--hold=}" ] || die "--hold= needs a plugin name" ;;
+        --unhold=*)    HOLD_DEL="$HOLD_DEL ${1#--unhold=}"
+                       [ -n "${1#--unhold=}" ] || die "--unhold= needs a plugin name" ;;
+        --hold|--unhold)
+                       die "$1 takes the name with it: $1=<plugin>" ;;
         --setup)       SETUP=1 ;;
         --host)        shift; [ $# -gt 0 ] || die "--host needs an ssh alias"
                        HOST_ARG="$1"; SETUP=1 ;;
@@ -174,7 +223,10 @@ while [ $# -gt 0 ]; do
                   printf '    %-9s %s\n' host "$SSH_HOST"
                   printf '    %-9s %s\n' remote "$REMOTE_WP"
                   printf '    %-9s %s\n' uploads "$REMOTE_UPLOADS"
-                  printf '    %-9s %s\n' local "$SITE_DIR" )
+                  printf '    %-9s %s\n' local "$SITE_DIR"
+                  if [ -n "${HOLD_PLUGINS:-}" ]; then
+                      printf '    %-9s %s\n' held "$HOLD_PLUGINS"
+                  fi )
             done
             exit 0 ;;
         -h|--help)     usage; exit 0 ;;
@@ -185,6 +237,16 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# Editing the hold list is part of `plugins`, and the only thing anyone means
+# by it on its own — defaulting to `all` there would run a whole backup as a
+# side effect of changing a setting.
+if [ -n "$HOLD_ADD$HOLD_DEL" ]; then
+    case "$WHAT" in
+        ''|plugins) WHAT="plugins" ;;
+        *)          die "--hold and --unhold belong to \`plugins\`, not \`$WHAT\`" ;;
+    esac
+fi
 
 WHAT="${WHAT:-all}"
 DO_PLUGINS=0
@@ -429,6 +491,16 @@ setup_site() {
             LOCAL_UPLOADS="${LOCAL_UPLOADS:-$SITE_DIR/uploads}" ;;
     esac
 
+    # HOLD_PLUGINS is the one setting here nothing discovers — a human writes
+    # it — so a --setup that rewrites everything else has to carry it over.
+    # Read it back the same way the script normally would, in a subshell so the
+    # old file's other values cannot overwrite what discovery just found.
+    if [ -r "$CONF" ]; then
+        # shellcheck disable=SC1090
+        HOLD_PLUGINS="$( . "$CONF" 2>/dev/null; printf '%s' "${HOLD_PLUGINS:-}" )" \
+            || HOLD_PLUGINS=""
+    fi
+
     # Everything is escaped on the way in. The remote values passed
     # safe_remote_path already; the local ones never do — a directory here may
     # legitimately be called anything, and this file gets sourced.
@@ -442,6 +514,11 @@ REMOTE_WP="$(conf_quote "$REMOTE_WP")"
 REMOTE_WP_BIN="$(conf_quote "$REMOTE_WP_BIN")"
 REMOTE_UPLOADS="$(conf_quote "$REMOTE_UPLOADS")"
 LOCAL_UPLOADS="$(conf_quote "$LOCAL_UPLOADS")"
+
+# Plugins to hold back: names \`backup-wp $SITE plugins\` shows as "server",
+# separated by spaces or commas. Held plugins are listed but never updated,
+# and this line survives --setup. Example: HOLD_PLUGINS="woocommerce acf-pro"
+HOLD_PLUGINS="$(conf_quote "${HOLD_PLUGINS:-}")"
 EOF
 
     step "Saved ${DIM}$CONF${RST}"
@@ -480,6 +557,7 @@ fi
 safe_ssh_host "$SSH_HOST"          || die "$CONF has an SSH_HOST that ssh would read as an option or a pattern: $SSH_HOST"
 safe_remote_path "$REMOTE_WP"      || die "$CONF has a REMOTE_WP this script will not put in a shell command: $REMOTE_WP"
 safe_remote_path "$REMOTE_UPLOADS" || die "$CONF has a REMOTE_UPLOADS this script will not put in a shell command: $REMOTE_UPLOADS"
+: "${HOLD_PLUGINS:=}"   # unset in every config written before it existed
 
 LOCAL_SQL="$SITE_DIR/sql"
 
@@ -653,8 +731,31 @@ composer_owned() {
         | awk -F/ '{print $2}' | sort -u
 }
 
+# Plugins the site's config holds back from updating. Parsed by `plugins`
+# rather than alongside the other config checks because that is the only
+# command it means anything to: a typo in it is worth stopping `plugins` over
+# and not worth stopping a backup over.
+HELD=""
+is_held() {
+    case " $HELD " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
 if [ "$DO_PLUGINS" -eq 1 ]; then
     step "Plugins"
+
+    # Commas are accepted as well as spaces — --update=a,b takes them, and
+    # nobody should have to remember which spelling goes where. `set -f` for
+    # the split: an entry is a glob until safe_plugin_slug has looked at it,
+    # and a bare `*` would otherwise expand to the working directory and hold
+    # whatever is sitting in it.
+    set -f
+    for slug in $(printf '%s' "$HOLD_PLUGINS" | tr ',' ' '); do
+        safe_plugin_slug "$slug" \
+            || die "$CONF holds \"$slug\" in HOLD_PLUGINS, which is not a plugin name — those are letters, digits, dots, dashes and underscores"
+        HELD="$HELD $slug"
+    done
+    set +f
 
     # No --skip-plugins here: premium plugins register their own update checks,
     # so skipping them hides exactly the updates this command exists to find.
@@ -693,13 +794,71 @@ $n = isset($t->no_update) ? (array) $t->no_update : array();
 foreach (array_merge(array_keys($r), array_keys($n)) as $f) { echo dirname($f), "\n"; }
 ' 2>/dev/null)" || known=""
 
+    # --hold and --unhold are applied here, between the listing and the table,
+    # for two reasons: a name can be checked against what is actually installed
+    # — a misspelled hold would otherwise sit in the config holding nothing,
+    # which is the failure this whole setting exists to prevent — and the table
+    # printed below then shows the list as it now stands.
+    if [ -n "$HOLD_ADD$HOLD_DEL" ]; then
+        # Field 1 of the CSV, minus its header. Names cannot contain a comma.
+        installed="$(printf '%s\n' "$listing" | cut -d, -f1 | grep -v '^name$' || true)"
+        changed=0
+
+        set -f
+        for want in $(printf '%s' "$HOLD_DEL" | tr ',' ' '); do
+            safe_plugin_slug "$want" || die "\"$want\" is not a plugin name"
+            is_held "$want" || die "$want is not held on $SITE (see: backup-wp $SITE plugins)"
+            kept=""
+            for h in $HELD; do
+                if [ "$h" != "$want" ]; then kept="$kept $h"; fi
+            done
+            HELD="$kept"; changed=1
+            info "released $want"
+        done
+        for want in $(printf '%s' "$HOLD_ADD" | tr ',' ' '); do
+            safe_plugin_slug "$want" \
+                || die "\"$want\" is not a plugin name — those are letters, digits, dots, dashes and underscores"
+            # -Fx, because a slug is a name and not a pattern.
+            printf '%s\n' "$installed" | grep -Fqx "$want" \
+                || die "no plugin named $want is installed on $SSH_HOST (see: backup-wp $SITE plugins)"
+            if is_held "$want"; then
+                info "$want was already held"
+            else
+                HELD="$HELD $want"; changed=1
+                info "holding $want"
+            fi
+        done
+        set +f
+
+        if [ "$changed" -eq 1 ]; then
+            if [ "$DRY" -eq 1 ]; then
+                info "would save HOLD_PLUGINS=\"${HELD# }\" to $CONF"
+            else
+                conf_set_hold "${HELD# }"
+                info "saved to ${DIM}$CONF${RST}"
+            fi
+        fi
+    fi
+
     owned="$(composer_owned)"
-    updatable=""; theirs=0; silent=""
+    updatable=""; theirs=0; silent=""; withheld=0
 
     while IFS=, read -r name status version update next; do
         if [ "$name" = "name" ] || [ -z "$name" ]; then continue; fi
         # must-use and drop-ins are not installed plugins and never update
         case "$status" in must-use|dropin) continue ;; esac
+        # A held plugin is a decision already taken, so it is shown only when
+        # there is something being held back. Held and silent stays quiet:
+        # "no updater" exists to send you off to check by hand, which is not
+        # advice to give about a plugin you have said to leave alone.
+        if is_held "$name"; then
+            if [ "$update" = "available" ]; then
+                printf '    %-26s %-9s → %-9s %sheld%s\n' \
+                    "$name" "$version" "$next" "$YEL" "$RST"
+                withheld=$((withheld + 1))
+            fi
+            continue
+        fi
         if [ "$update" != "available" ]; then
             # Server-managed and never heard from: a human has to go and look.
             if ! printf '%s\n' "$owned" | grep -Fqx "$name" \
@@ -736,6 +895,11 @@ EOF
         info "updating them here is undone by the next deploy"
     fi
 
+    if [ "$withheld" -gt 0 ]; then
+        info "held ones stay put until ${B}--unhold=<name>${RST} — the list is"
+        info "HOLD_PLUGINS in $CONF"
+    fi
+
     if [ -n "$silent" ]; then
         info "\"no updater\" means WordPress has never heard from that plugin, not"
         info "that it is current. Check those by hand; --update cannot fetch an"
@@ -755,6 +919,8 @@ EOF
         for want in $(printf '%s' "$ONLY" | tr ',' ' '); do
             if in_list "$want" "$updatable"; then
                 chosen="$chosen $want"
+            elif is_held "$want"; then
+                die "$want is held on $SITE — release it with \`backup-wp $SITE plugins --unhold=$want\` if you mean to update it"
             elif printf '%s\n' "$owned" | grep -Fqx "$want"; then
                 die "$want is Composer-managed — update it with \`composer update\` locally, or the next deploy reverts it"
             elif in_list "$want" "$(printf '%s' "$silent" | tr ':' ' ')"; then
@@ -767,7 +933,11 @@ EOF
     fi
 
     if [ -z "$updatable" ]; then
-        info "nothing to update on the server"
+        if [ "$withheld" -gt 0 ]; then
+            info "everything with a pending update is held"
+        else
+            info "nothing to update on the server"
+        fi
     elif [ "$APPLY" -eq 0 ]; then
         info "run with ${B}--update${RST} for all of these, or ${B}--update=<name>${RST} for one"
     else

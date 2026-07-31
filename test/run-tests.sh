@@ -573,6 +573,193 @@ assert_eq "$(sort "$TMP/updated.log" | tr '\n' ' ')" "in-composer premium-thing 
           "...where every pending update is fair game"
 mv "$TMP/composer.json.bak" "$SITE_DIR/composer.json"
 
+# ── held plugins ────────────────────────────────────────────────────────────
+group "held plugins"
+
+# Rewrite HOLD_PLUGINS in place, the way a human editing the config would.
+# Under the same umask the script uses, or this leaves a world-readable config
+# behind and the later check that dumps and configs stay private fails on the
+# harness's doing rather than the script's.
+set_hold() {
+    ( umask 077; grep -v '^HOLD_PLUGINS=' "$CONF" > "$CONF.new" ) || true
+    printf 'HOLD_PLUGINS="%s"\n' "$1" >> "$CONF.new"
+    mv "$CONF.new" "$CONF"
+}
+
+if grep -q '^HOLD_PLUGINS=' "$CONF"; then
+    ok "setup writes HOLD_PLUGINS into the config"
+else
+    bad "setup writes HOLD_PLUGINS into the config"
+fi
+
+set_hold "server-only"
+: > "$TMP/updated.log"
+run plugins
+assert_rc 0 "plugins lists with a plugin held"
+assert_has "held" "a held plugin with an update says so"
+assert_has "HOLD_PLUGINS" "...and names the setting that holds it"
+
+: > "$TMP/updated.log"
+run plugins --update
+assert_rc 0 "--update runs with a plugin held"
+assert_eq "$(sort "$TMP/updated.log" | tr '\n' ' ')" "premium-thing " \
+          "...passing over the held one"
+
+# Naming a held plugin explicitly must not override the hold: silently
+# updating it would make the setting worthless, and silently skipping it would
+# look like success.
+: > "$TMP/updated.log"
+run plugins --update=server-only
+assert_rc 1 "naming a held plugin is refused"
+assert_has "is held on $SITE" "...saying what holds it"
+assert_has "--unhold=server-only" "...and how to release it"
+assert_eq "$(wc -l < "$TMP/updated.log" | tr -d ' ')" "0" "...having updated nothing"
+
+# Commas, because --update=a,b takes them
+set_hold "server-only,premium-thing"
+: > "$TMP/updated.log"
+run plugins --update
+assert_rc 0 "a comma-separated hold list parses"
+assert_eq "$(wc -l < "$TMP/updated.log" | tr -d ' ')" "0" "...holding both plugins"
+assert_has "everything with a pending update is held" \
+          "...and says why nothing was updated"
+
+# A held plugin nobody has heard from must not be nagged about: "no updater"
+# exists to send you off to update by hand, which is not advice to give about
+# a plugin you have said to leave alone.
+set_hold "premium-thing"
+STUB_ADMIN_FAILS=1 run plugins
+assert_rc 0 "listing survives with a silent plugin held"
+case "$OUT" in
+    *"no updater"*) bad "a held plugin is not reported as unchecked" ;;
+    *)              ok  "a held plugin is not reported as unchecked" ;;
+esac
+
+# A `*` would otherwise be split into a glob and hold the working directory's
+# contents, so it has to be refused rather than obeyed.
+set_hold "*"
+: > "$TMP/updated.log"
+run plugins --update
+assert_rc 1 "a hold entry that is not a plugin name is refused"
+assert_has "not a plugin name" "...with a clear reason"
+assert_eq "$(wc -l < "$TMP/updated.log" | tr -d ' ')" "0" "...having updated nothing"
+
+# ...but it is only the plugins command's business. A backup must not stop
+# because of a typo in a setting it never reads.
+run db
+assert_rc 0 "a broken hold list does not stop a backup"
+
+# The list is hand-written, so rediscovery has to carry it over
+set_hold "server-only premium-thing"
+run --setup --host stub-host
+assert_rc 0 "--setup succeeds with plugins held"
+assert_eq "$(conf_get HOLD_PLUGINS)" "server-only premium-thing" \
+          "--setup keeps the hold list it did not discover"
+
+set_hold ""
+
+# ── --hold / --unhold ───────────────────────────────────────────────────────
+group "holding from the command line"
+
+: > "$TMP/updated.log"
+run plugins --hold=server-only
+assert_rc 0 "--hold succeeds"
+assert_has "holding server-only" "...saying what it did"
+assert_eq "$(conf_get HOLD_PLUGINS)" "server-only" "...and writing it to the config"
+assert_has "held" "the listing already shows the new hold"
+assert_eq "$(wc -l < "$TMP/updated.log" | tr -d ' ')" "0" "...updating nothing on the way"
+
+# The whole point of the flag over hand-editing: a name that is not installed
+# would sit in the config holding nothing at all.
+run plugins --hold=no-such-plugin
+assert_rc 1 "holding a plugin that is not installed is refused"
+assert_has "no plugin named no-such-plugin" "...with a clear reason"
+assert_eq "$(conf_get HOLD_PLUGINS)" "server-only" "...leaving the list as it was"
+
+run plugins --hold=server-only
+assert_rc 0 "holding an already-held plugin is not an error"
+assert_has "already held" "...but says so"
+assert_eq "$(conf_get HOLD_PLUGINS)" "server-only" "...without listing it twice"
+
+# Adding one must not drop the other
+run plugins --hold=premium-thing
+assert_rc 0 "a second --hold succeeds"
+assert_eq "$(conf_get HOLD_PLUGINS)" "server-only premium-thing" "...and joins the first"
+
+run plugins --unhold=server-only
+assert_rc 0 "--unhold succeeds"
+assert_has "released server-only" "...saying what it did"
+assert_eq "$(conf_get HOLD_PLUGINS)" "premium-thing" "...leaving the other held"
+
+run plugins --unhold=server-only
+assert_rc 1 "releasing a plugin that is not held is refused"
+assert_has "is not held" "...rather than quietly doing nothing"
+
+: > "$TMP/updated.log"
+run plugins --hold=server-only -n
+assert_rc 0 "--hold -n succeeds"
+assert_has "would save" "dry run says what it would write"
+assert_eq "$(conf_get HOLD_PLUGINS)" "premium-thing" "dry run writes no config"
+
+# Held in the same run it updates: the hold has to land before the update does
+: > "$TMP/updated.log"
+run plugins --hold=server-only --update
+assert_rc 0 "--hold and --update together succeed"
+assert_eq "$(wc -l < "$TMP/updated.log" | tr -d ' ')" "0" \
+          "...holding the plugin before --update reaches it"
+
+run plugins --unhold=server-only,premium-thing
+assert_rc 0 "--unhold takes a comma-separated list"
+assert_eq "$(conf_get HOLD_PLUGINS)" "" "...releasing every name in it"
+
+# The rest of the file has to survive being rewritten
+assert_eq "$(conf_get SSH_HOST)" "stub-host" "editing the hold list leaves the config intact"
+if grep -q '^# backup-wp — ' "$CONF"; then
+    ok "...comments included"
+else
+    bad "...comments included"
+fi
+
+# Naming a plugin to hold is not a reason to run a backup
+run db --hold=server-only
+assert_rc 1 "--hold with another action is refused"
+assert_has "belong to \`plugins\`" "...saying where it belongs"
+run --hold
+assert_rc 1 "a bare --hold is refused"
+assert_has "takes the name with it" "...pointing at the right spelling"
+
+# ...but with no action word at all, --hold implies `plugins` and stops there.
+# Falling through to the `all` default would dump a database and mirror the
+# uploads as a side effect of changing one setting.
+#
+# Counting files in the backup tree would not prove this: by now it is at its
+# retention cap, so a stray snapshot is written and immediately trimmed back to
+# the same number. Watch for the work itself instead — the step the dump prints
+# and a call reaching the rsync stub, neither of which `plugins` ever produces.
+: > "$TMP/hold-rsync.log"
+STUB_RSYNC_LOG="$TMP/hold-rsync.log" run --hold=server-only
+assert_rc 0 "--hold with no action given succeeds"
+assert_eq "$(conf_get HOLD_PLUGINS)" "server-only" "...saving the hold"
+case "$OUT" in
+    *"==> Database"*) bad "...and dumping no database while it is at it" ;;
+    *)                ok  "...and dumping no database while it is at it" ;;
+esac
+assert_eq "$(wc -l < "$TMP/hold-rsync.log" | tr -d ' ')" "0" "...and mirroring nothing"
+run --unhold=server-only
+assert_rc 0 "--unhold with no action given succeeds"
+assert_eq "$(conf_get HOLD_PLUGINS)" "" "...releasing it again"
+
+# A config too old to have the line still gets one
+( umask 077; grep -v '^HOLD_PLUGINS=' "$CONF" > "$CONF.old" ) && mv "$CONF.old" "$CONF"
+run plugins --hold=server-only
+assert_rc 0 "--hold works on a config written before the setting existed"
+assert_eq "$(conf_get HOLD_PLUGINS)" "server-only" "...adding the line"
+
+# The rewrite replaces the file, so it is a fresh chance to leak a config full
+# of hostnames and paths to everyone on the machine.
+assert_eq "$(modestr "$CONF")" "-rw-------" "a rewritten config is still private"
+run plugins --unhold=server-only
+
 # ── retention ───────────────────────────────────────────────────────────────
 group "retention"
 

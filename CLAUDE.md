@@ -67,6 +67,21 @@ Break any of these and the tool stops being trustworthy:
 
 ## Constraints worth knowing
 
+**`HOLD_PLUGINS` is the one config value nothing discovers.** `--hold` and
+`--unhold` write it, and a human may too, so `setup_site` reads the old config
+back before it rewrites the file — a rediscovery that silently drops a hold
+list is how a plugin someone pinned on purpose gets updated. `conf_set_hold`
+replaces that one line and copies the rest through, comments included, for the
+same reason.
+
+The list is parsed inside the `plugins` branch rather than with the config
+checks, because a typo in it should stop `plugins` and never stop a backup, and
+it is split under `set -f`: an entry is a glob until `safe_plugin_slug` has
+vetted it. `--hold` is applied after the listing comes back, not at parse time,
+so the name can be checked against what is actually installed — a hold that
+holds nothing is the failure the setting exists to prevent — and so the table
+prints the list as it now stands.
+
 **Target bash 3.2.** That's what macOS ships as `/bin/bash`, and `#!/usr/bin/env
 bash` finds it. No associative arrays, no `${var^^}`, no `mapfile`. Empty-array
 expansion under `set -u` needs the `${arr[*]-}` form.
