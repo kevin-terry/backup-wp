@@ -131,6 +131,8 @@ comes from `wp_upload_dir()`.
 backup-wp plugins                       # what has updates, and who owns each
 backup-wp plugins --update              # apply every server-managed one
 backup-wp plugins --update=some-plugin  # ...or just the one you specify
+backup-wp plugins --hold=some-plugin    # ...adds plugin to hold list and will no longer update
+backup-wp plugins --unhold=some-plugin  # ...removes plugin from hold list allowing updates again
 ```
 
 ```console
