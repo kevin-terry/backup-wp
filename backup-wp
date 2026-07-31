@@ -3,8 +3,8 @@
 # backup-wp — pull a WordPress site's database and uploads down from production.
 #
 #   backup-wp pre                  # DB snapshot, before you deploy
-#   backup-wp post                 # DB snapshot + uploads mirror, after
-#   backup-wp post --archive       # ...and a dated tar.zst of the uploads
+#   backup-wp post                 # DB + uploads + a dated tar.zst of them
+#   backup-wp post --no-archive    # ...without the tar.zst
 #   backup-wp example-site db      # any site, from anywhere, by key
 #
 # Run it from inside a site's project directory and it works out which site you
@@ -107,6 +107,7 @@ usage: backup-wp [<site>] [<what>] [options]
 what
   pre        database only, tagged "pre"        (run before `git deploy`)
   post       database tagged "post" + uploads   (run after the deploy)
+             implies --archive; --no-archive turns it back off
   db         database only, untagged
   uploads    uploads mirror only
   all        database + uploads                 (the default)
@@ -114,6 +115,7 @@ what
 
 options
   -a, --archive     also build a dated .tar.zst of the uploads
+      --no-archive  skip that archive where it is the default
   -n, --dry-run     show what would happen; transfers nothing
   -f, --force       skip the first-run confirmation before an rsync --delete
       --no-prune    keep every old snapshot instead of trimming to $KEEP
@@ -139,7 +141,9 @@ EOF
 }
 
 # ── argument parsing ────────────────────────────────────────────────────────
-SITE=""; WHAT=""; ARCHIVE=0; DRY=0; FORCE=0; PRUNE=1; SETUP=0; HOST_ARG=""
+# ARCHIVE starts empty rather than 0 so `post` can default it to 1 below
+# without overriding an explicit --no-archive, whichever order they were given.
+SITE=""; WHAT=""; ARCHIVE=""; DRY=0; FORCE=0; PRUNE=1; SETUP=0; HOST_ARG=""
 RESCUE_ON=1; APPLY=0; ONLY=""
 
 while [ $# -gt 0 ]; do
@@ -148,6 +152,7 @@ while [ $# -gt 0 ]; do
             [ -z "$WHAT" ] || die "more than one action given: $WHAT and $1"
             WHAT="$1" ;;
         -a|--archive)  ARCHIVE=1 ;;
+        --no-archive)  ARCHIVE=0 ;;
         -n|--dry-run)  DRY=1 ;;
         -f|--force)    FORCE=1 ;;
         --no-prune)    PRUNE=0 ;;
@@ -185,12 +190,15 @@ WHAT="${WHAT:-all}"
 DO_PLUGINS=0
 case "$WHAT" in
     pre)     DO_DB=1; DO_UP=0; LABEL="pre"  ;;
-    post)    DO_DB=1; DO_UP=1; LABEL="post" ;;
+    # `post` is the after-the-deploy record of what production held, so it
+    # keeps the archive as well as the mirror unless told otherwise.
+    post)    DO_DB=1; DO_UP=1; LABEL="post"; ARCHIVE="${ARCHIVE:-1}" ;;
     db)      DO_DB=1; DO_UP=0; LABEL=""     ;;
     uploads) DO_DB=0; DO_UP=1; LABEL=""     ;;
     all)     DO_DB=1; DO_UP=1; LABEL=""     ;;
     plugins) DO_DB=0; DO_UP=0; LABEL=""; DO_PLUGINS=1 ;;
 esac
+ARCHIVE="${ARCHIVE:-0}"
 
 # ── which site? ─────────────────────────────────────────────────────────────
 # Recognise a project by structure, never by directory name. Docroots get

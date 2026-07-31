@@ -450,6 +450,29 @@ else
     bad "builds a .tar.zst"
 fi
 
+# `post` is the one action that archives without being asked, and --no-archive
+# has to win over that default whichever side of the action it is given on.
+run post -n
+assert_has ".tar.zst" "post archives without --archive"
+
+for args in "post -n --no-archive" "--no-archive post -n"; do
+    # shellcheck disable=SC2086  # deliberate word splitting: these are argv
+    run $args
+    # The exit status matters here: without it a run that died on "unknown
+    # option: --no-archive" would pass this by printing no archive at all.
+    assert_rc 0 "--no-archive is accepted ($args)"
+    case "$OUT" in
+        *.tar.zst*) bad "--no-archive turns post's archive back off ($args)" ;;
+        *)          ok  "--no-archive turns post's archive back off ($args)" ;;
+    esac
+done
+
+run uploads -n
+case "$OUT" in
+    *.tar.zst*) bad "the other actions still archive only on request" ;;
+    *)          ok  "the other actions still archive only on request" ;;
+esac
+
 # ── plugins ─────────────────────────────────────────────────────────────────
 group "plugins"
 

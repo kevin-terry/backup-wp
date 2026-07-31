@@ -56,7 +56,8 @@ Skip the question with `backup-wp --host example-prod`.
 ```bash
 backup-wp                      # DB + uploads mirror (the default)
 backup-wp pre                  # DB only, tagged "pre"
-backup-wp post                 # DB + uploads mirror, tagged "post"
+backup-wp post                 # DB + uploads mirror + .tar.zst, tagged "post"
+backup-wp post --no-archive    # ...without the .tar.zst
 backup-wp db                   # DB only
 backup-wp uploads              # uploads only
 backup-wp uploads --archive    # uploads + a .tar.zst archieve of uploads
@@ -70,6 +71,7 @@ TIP: The site comes from the directory you're in. To work from anywhere add the 
 | Flag             | Effect                                                  |
 | ---------------- | ------------------------------------------------------- |
 | `-a, --archive`  | also build a dated `.tar.zst` of the uploads            |
+| `--no-archive`   | skip that archive where it is the default (`post`)      |
 | `-n, --dry-run`  | show what would happen; transfer nothing                |
 | `-f, --force`    | skip the first-run confirmation before `rsync --delete` |
 | `--no-prune`     | keep every old snapshot instead of trimming             |
