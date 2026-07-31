@@ -37,7 +37,7 @@ RSYNC="${RSYNC:-$(command -v rsync)}"
 KEEP="${KEEP:-10}"          # dated copies to keep, per artifact type, per site
 KEEP_SQL="${KEEP_SQL:-3}"   # plain .sql working copies to keep in the project
 
-STAMP="$(date +%Y%m%d-%H%M%S)"
+STAMP="$(date +%Y-%m-%d-%H%M%S)"
 DEST_DIR="$BACKUP_ROOT/$(date +%Y)/$(date +%m)"
 
 # ── output ──────────────────────────────────────────────────────────────────
@@ -140,8 +140,8 @@ usage() {
 usage: backup-wp [<site>] [<what>] [options]
 
 what
-  pre        database only, tagged "pre"        (run before `git deploy`)
-  post       database tagged "post" + uploads   (run after the deploy)
+  pre        database only, tagged "pre-update"   (run before `git deploy`)
+  post       database tagged "post-update" + uploads (run after the deploy)
              implies --archive; --no-archive turns it back off
   db         database only, untagged
   uploads    uploads mirror only
@@ -251,10 +251,10 @@ fi
 WHAT="${WHAT:-all}"
 DO_PLUGINS=0
 case "$WHAT" in
-    pre)     DO_DB=1; DO_UP=0; LABEL="pre"  ;;
+    pre)     DO_DB=1; DO_UP=0; LABEL="pre-update"  ;;
     # `post` is the after-the-deploy record of what production held, so it
     # keeps the archive as well as the mirror unless told otherwise.
-    post)    DO_DB=1; DO_UP=1; LABEL="post"; ARCHIVE="${ARCHIVE:-1}" ;;
+    post)    DO_DB=1; DO_UP=1; LABEL="post-update"; ARCHIVE="${ARCHIVE:-1}" ;;
     db)      DO_DB=1; DO_UP=0; LABEL=""     ;;
     uploads) DO_DB=0; DO_UP=1; LABEL=""     ;;
     all)     DO_DB=1; DO_UP=1; LABEL=""     ;;
@@ -563,7 +563,10 @@ LOCAL_SQL="$SITE_DIR/sql"
 
 # ── paths for this run ──────────────────────────────────────────────────────
 SITE_BACKUPS="$DEST_DIR/$SITE"
-NAME="$SITE-db-$STAMP${LABEL:+-$LABEL}"
+# The label sits between the kind and the date so a listing groups by what the
+# snapshot is; the stamp always ends the name, which is where retention reads it
+# back from.
+NAME="$SITE-db${LABEL:+-$LABEL}-$STAMP"
 DB_GZ="$SITE_BACKUPS/$NAME.sql.gz"
 DB_SQL="$LOCAL_SQL/$NAME.sql"
 UP_TAR="$SITE_BACKUPS/$SITE-uploads-$STAMP.tar.zst"
@@ -953,17 +956,41 @@ EOF
 fi
 
 # ── 4. prune ────────────────────────────────────────────────────────────────
-# Timestamps lead the filename, so a reverse sort is newest-first.
+# Age is read from the stamp the name ends in, never from the name as a whole:
+# `pre-update` and `post-update` sit in front of the date, so a plain reverse
+# sort would rank every pre- above every post- above every unlabelled snapshot
+# and delete this morning's backup while keeping one from last spring. Each
+# path is tagged with its stamp and sorted on that instead.
+#
+# A name from before this scheme (<site>-db-20200101-000000-pre.sql.gz) tags as
+# zeros and so sorts oldest, which is exactly what it is: every one of them
+# predates the rename.
 #
 # The depth bounds are the safety rail: retention is confined to the exact
 # level this script writes to, so anything filed elsewhere under the backup
 # root — a manual export, a keep/ folder, an old dump — is invisible to it
 # even when the name matches.
+newest_first() {
+    local ext="$1" f base key
+    while IFS= read -r f; do
+        base="${f##*/}"
+        key="${base%"$ext"}"
+        key="${key: -17}"
+        case "$key" in
+            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            *) key="00000000000000000" ;;
+        esac
+        printf '%s\t%s\n' "$key" "$f"
+    done | LC_ALL=C sort -r | cut -c19-
+}
+
 prune() {
     local dir="$1" pattern="$2" keep="$3" mind="$4" maxd="$5"
     [ -d "$dir" ] || return 0
+    # Every pattern here is <prefix>*<extension>, so what follows the wildcard
+    # is the suffix to strip before reading the stamp off the end.
     find "$dir" -mindepth "$mind" -maxdepth "$maxd" -type f -name "$pattern" \
-        2>/dev/null | sort -r | tail -n "+$((keep + 1))" |
+        2>/dev/null | newest_first "${pattern##*\*}" | tail -n "+$((keep + 1))" |
         while IFS= read -r old; do
             if [ "$DRY" -eq 1 ]; then
                 info "would prune $(basename "$old")"

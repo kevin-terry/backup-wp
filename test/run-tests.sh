@@ -360,7 +360,7 @@ group "database"
 
 run pre
 assert_rc 0 "pre run succeeds"
-GZ="$(find "$BACKUPS" -type f -name "$SITE-db-*-pre.sql.gz" 2>/dev/null | head -1)"
+GZ="$(find "$BACKUPS" -type f -name "$SITE-db-pre-update-*.sql.gz" 2>/dev/null | head -1)"
 if [ -n "$GZ" ]; then
     ok "writes a labelled .sql.gz"
     if gzip -t "$GZ" 2>/dev/null; then ok "the gzip is valid"; else bad "the gzip is valid"; fi
@@ -430,9 +430,9 @@ assert_eq "$(find "$BACKUPS" -type d -name 'rescued-*' | wc -l | tr -d ' ')" \
 
 # rescued files must be immune to retention, whatever they are called
 mkdir -p "$RESCUED"
-: > "$RESCUED/$SITE-db-20200101-000000.sql.gz"
+: > "$RESCUED/$SITE-db-2020-01-01-000000.sql.gz"
 KEEP=1 run db
-assert_file "$RESCUED/$SITE-db-20200101-000000.sql.gz" \
+assert_file "$RESCUED/$SITE-db-2020-01-01-000000.sql.gz" \
             "retention cannot reach inside a rescue folder"
 
 run uploads --archive
@@ -764,35 +764,58 @@ run plugins --unhold=server-only
 group "retention"
 
 rm -f "$DEST"/*.sql.gz
-for s in 20200101 20200102 20200103 20200104; do
+for s in 2020-01-01 2020-01-02 2020-01-03 2020-01-04; do
     : > "$DEST/$SITE-db-$s-000000.sql.gz"
 done
 
 # decoys: matching names in the wrong place, plus a directory and a foreign name
-mkdir -p "$BACKUPS/manual" "$BACKUPS/keep/deep" "$DEST/$SITE-db-20190104-000000.sql.gz"
-: > "$BACKUPS/manual/$SITE-db-20190101-000000.sql.gz"
-: > "$BACKUPS/keep/deep/$SITE-db-20190102-000000.sql.gz"
-: > "$BACKUPS/$SITE-db-20190103-000000.sql.gz"
+mkdir -p "$BACKUPS/manual" "$BACKUPS/keep/deep" "$DEST/$SITE-db-2019-01-04-000000.sql.gz"
+: > "$BACKUPS/manual/$SITE-db-2019-01-01-000000.sql.gz"
+: > "$BACKUPS/keep/deep/$SITE-db-2019-01-02-000000.sql.gz"
+: > "$BACKUPS/$SITE-db-2019-01-03-000000.sql.gz"
 : > "$DEST/notes.txt"
 : > "$DEST/manual-export.sql.gz"
 
 KEEP=2 run db
 assert_rc 0 "run with KEEP=2 succeeds"
 assert_eq "$(managed)" "2" "trims managed snapshots to KEEP"
-assert_file "$BACKUPS/manual/$SITE-db-20190101-000000.sql.gz"    "spares a manual/ subfolder"
-assert_file "$BACKUPS/keep/deep/$SITE-db-20190102-000000.sql.gz" "spares a nested folder"
-assert_file "$BACKUPS/$SITE-db-20190103-000000.sql.gz"           "spares the backup root"
-assert_file "$DEST/notes.txt"                                    "spares unrelated files"
-assert_file "$DEST/manual-export.sql.gz"                         "spares foreign names"
-assert_dir  "$DEST/$SITE-db-20190104-000000.sql.gz"              "spares matching directories"
+assert_file "$BACKUPS/manual/$SITE-db-2019-01-01-000000.sql.gz"    "spares a manual/ subfolder"
+assert_file "$BACKUPS/keep/deep/$SITE-db-2019-01-02-000000.sql.gz" "spares a nested folder"
+assert_file "$BACKUPS/$SITE-db-2019-01-03-000000.sql.gz"           "spares the backup root"
+assert_file "$DEST/notes.txt"                                      "spares unrelated files"
+assert_file "$DEST/manual-export.sql.gz"                           "spares foreign names"
+assert_dir  "$DEST/$SITE-db-2019-01-04-000000.sql.gz"              "spares matching directories"
+
+# The label sits in front of the date, so sorting on the whole name would rank
+# every pre-update snapshot above every unlabelled one and trim the newest
+# backups to keep years-old ones. Age comes from the stamp on the end.
+find "$DEST" -maxdepth 1 -type f -name '*.sql.gz' -exec rm -f {} +
+: > "$DEST/$SITE-db-pre-update-2020-01-01-000000.sql.gz"
+: > "$DEST/$SITE-db-post-update-2020-01-02-000000.sql.gz"
+: > "$DEST/$SITE-db-2021-01-01-000000.sql.gz"
+KEEP=2 run db
+assert_eq "$(managed)" "2" "trims a mix of labelled and unlabelled to KEEP"
+assert_file "$DEST/$SITE-db-2021-01-01-000000.sql.gz" \
+            "keeps the newest snapshot whatever it is labelled"
+assert_gone "$DEST/$SITE-db-pre-update-2020-01-01-000000.sql.gz" \
+            "...and drops the oldest, label or no label"
+
+# Names written before the rename carry no readable stamp. They must still be
+# reachable by retention, and they are the oldest thing here.
+find "$DEST" -maxdepth 1 -type f -name '*.sql.gz' -exec rm -f {} +
+: > "$DEST/$SITE-db-20200101-000000-pre.sql.gz"
+: > "$DEST/$SITE-db-2021-01-01-000000.sql.gz"
+KEEP=2 run db
+assert_gone "$DEST/$SITE-db-20200101-000000-pre.sql.gz" "trims an old-style name first"
+assert_file "$DEST/$SITE-db-2021-01-01-000000.sql.gz"   "...before anything newer"
 
 # --no-prune must leave even the oldest alone
-for s in 20200101 20200102 20200103 20200104; do
+for s in 2020-01-01 2020-01-02 2020-01-03 2020-01-04; do
     : > "$DEST/$SITE-db-$s-000000.sql.gz"
 done
 KEEP=2 run db --no-prune
 assert_rc 0 "--no-prune succeeds"
-assert_file "$DEST/$SITE-db-20200101-000000.sql.gz" "--no-prune spares the oldest"
+assert_file "$DEST/$SITE-db-2020-01-01-000000.sql.gz" "--no-prune spares the oldest"
 
 # ── what it refuses ─────────────────────────────────────────────────────────
 # Discovery believes what the server tells it, and the uploads path it hears
@@ -906,7 +929,9 @@ group "what the dump is readable by"
 # default umask would hand it to anyone else with an account on this machine,
 # and the .part it is assembled in has an entirely predictable name.
 run db
-LAST_GZ="$(find "$DEST" -maxdepth 1 -type f -name "$SITE-db-*.sql.gz" | sort | tail -1)"
+# unlabelled names only: `db` writes one of those, and a `pre-update-` name
+# would sort above every one of them.
+LAST_GZ="$(find "$DEST" -maxdepth 1 -type f -name "$SITE-db-[0-9]*.sql.gz" | sort | tail -1)"
 assert_eq "$(modestr "$LAST_GZ")" "-rw-------" "the compressed dump is readable only by its owner"
 assert_eq "$(modestr "$SQL_DIR/$(basename "$LAST_GZ" .sql.gz).sql")" "-rw-------" \
           "...and so is the plain .sql beside the project"

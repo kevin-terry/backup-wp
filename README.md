@@ -56,8 +56,8 @@ Skip the question with `backup-wp --host example-prod`.
 backup-wp                      # DB + uploads mirror (the default)
 backup-wp --archive            # DB + uploads mirror + .tar.zst archive of uploads
 
-backup-wp pre                  # DB only, tagged "pre" (pre update)
-backup-wp post                 # DB + uploads mirror + .tar.zst, tagged "post" (post update)
+backup-wp pre                  # DB only, tagged "pre-update"
+backup-wp post                 # DB + uploads mirror + .tar.zst, tagged "post-update"
 backup-wp post --no-archive    # ...without the .tar.zst
 
 backup-wp db                   # DB only
@@ -92,10 +92,11 @@ TIP: The site comes from the directory you're in. To work from anywhere add the 
 
 ```text
 ~/Site Backups/<year>/<month>/<site>/
-    <site>-db-20260130-091200-pre.sql.gz
-    <site>-db-20260130-104300-post.sql.gz
-    <site>-uploads-20260130-104300.tar.zst
-    rescued-20260130-104300/            <- anything the mirror replaced
+    <site>-db-pre-update-2026-01-30-091200.sql.gz
+    <site>-db-post-update-2026-01-30-104300.sql.gz
+    <site>-db-2026-01-30-131500.sql.gz        <- from `db` or `all`
+    <site>-uploads-2026-01-30-104300.tar.zst
+    rescued-2026-01-30-104300/                <- anything the mirror replaced
 
 ~/Sites/<site>/public_html/uploads/     <- mirror of production
 ~/Sites/<site>/sql/latest.sql           <- newest dump, uncompressed

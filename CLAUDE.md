@@ -39,6 +39,14 @@ Break any of these and the tool stops being trustworthy:
   `<backup root>/<year>/<month>/<site>/` are eligible for trimming, so anything
   a user files elsewhere under the backup root is untouchable even when the name
   matches. Widening that search is a data-loss bug.
+
+  Which of those files goes first comes from the `-<year>-<month>-<day>-<stamp>`
+  the name ends in, never from the name as a whole: `pre-update` and
+  `post-update` sit in front of the date, so a plain reverse sort would rank
+  every pre- above every post- above every unlabelled snapshot and delete
+  today's backup to keep last year's. A name that carries no readable stamp —
+  everything written before this scheme — sorts oldest and leaves first, which
+  is what it is. Anything that changes the filename has to keep the stamp last.
 - **Guessing is always announced.** Where a path can't be derived, the script
   says it guessed and names the setting to correct.
 - **What the server says is input, not fact.** The uploads path discovery gets
