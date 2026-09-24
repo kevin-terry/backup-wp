@@ -40,13 +40,17 @@ Break any of these and the tool stops being trustworthy:
   a user files elsewhere under the backup root is untouchable even when the name
   matches. Widening that search is a data-loss bug.
 
-  Which of those files goes first comes from the `-<year>-<month>-<day>-<stamp>`
-  the name ends in, never from the name as a whole: `pre-update` and
-  `post-update` sit in front of the date, so a plain reverse sort would rank
-  every pre- above every post- above every unlabelled snapshot and delete
-  today's backup to keep last year's. A name that carries no readable stamp —
-  everything written before this scheme — sorts oldest and leaves first, which
-  is what it is. Anything that changes the filename has to keep the stamp last.
+  Which of those files goes first is decided by a reverse sort, and that is only
+  newest-first because the fixed-width stamp leads every name — everything after
+  it (`-database`, `-database-pre-update`, `-uploads`) describes the same moment
+  and never gets a vote. Move the stamp off the front and retention silently
+  starts ranking by label, deleting today's backup to keep last year's.
+
+  The patterns spell that stamp out digit by digit rather than reaching it with
+  a wildcard, so the sort only ever sees names this script wrote. A name with no
+  stamp can't be ordered against one that has, so it is never picked up at all:
+  that includes every backup made before this naming, and a hand-filed
+  `<site>-something-database.sql.gz` sitting in the same folder.
 - **Guessing is always announced.** Where a path can't be derived, the script
   says it guessed and names the setting to correct.
 - **What the server says is input, not fact.** The uploads path discovery gets

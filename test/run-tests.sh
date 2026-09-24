@@ -205,7 +205,8 @@ conf_get() { grep "^$1=" "$CONF" | cut -d'"' -f2; }
 
 DEST="$BACKUPS/$(date +%Y)/$(date +%m)/$SITE"
 parts() { find "$BACKUPS" "$SQL_DIR" -name '*.part' 2>/dev/null | wc -l | tr -d ' '; }
-managed() { find "$DEST" -maxdepth 1 -type f -name "$SITE-db-*.sql.gz" 2>/dev/null | wc -l | tr -d ' '; }
+STAMPED='[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
+managed() { find "$DEST" -maxdepth 1 -type f -name "$SITE-$STAMPED-database*.sql.gz" 2>/dev/null | wc -l | tr -d ' '; }
 
 # ── argument handling ───────────────────────────────────────────────────────
 group "argument handling"
@@ -360,7 +361,7 @@ group "database"
 
 run pre
 assert_rc 0 "pre run succeeds"
-GZ="$(find "$BACKUPS" -type f -name "$SITE-db-pre-update-*.sql.gz" 2>/dev/null | head -1)"
+GZ="$(find "$BACKUPS" -type f -name "$SITE-*-database-pre-update.sql.gz" 2>/dev/null | head -1)"
 if [ -n "$GZ" ]; then
     ok "writes a labelled .sql.gz"
     if gzip -t "$GZ" 2>/dev/null; then ok "the gzip is valid"; else bad "the gzip is valid"; fi
@@ -430,14 +431,14 @@ assert_eq "$(find "$BACKUPS" -type d -name 'rescued-*' | wc -l | tr -d ' ')" \
 
 # rescued files must be immune to retention, whatever they are called
 mkdir -p "$RESCUED"
-: > "$RESCUED/$SITE-db-2020-01-01-000000.sql.gz"
+: > "$RESCUED/$SITE-2020-01-01-000000-database.sql.gz"
 KEEP=1 run db
-assert_file "$RESCUED/$SITE-db-2020-01-01-000000.sql.gz" \
+assert_file "$RESCUED/$SITE-2020-01-01-000000-database.sql.gz" \
             "retention cannot reach inside a rescue folder"
 
 run uploads --archive
 assert_rc 0 "archive run succeeds"
-TAR="$(find "$BACKUPS" -type f -name "$SITE-uploads-*.tar.zst" 2>/dev/null | head -1)"
+TAR="$(find "$BACKUPS" -type f -name "$SITE-*-uploads.tar.zst" 2>/dev/null | head -1)"
 if [ -n "$TAR" ]; then
     ok "builds a .tar.zst"
     if zstd -t "$TAR" >/dev/null 2>&1; then ok "the archive verifies"; else bad "the archive verifies"; fi
@@ -450,20 +451,27 @@ else
     bad "builds a .tar.zst"
 fi
 
-# `post` is the one action that archives without being asked, and --no-archive
+# `pre` is the one action that archives without being asked, and --no-archive
 # has to win over that default whichever side of the action it is given on.
-run post -n
-assert_has ".tar.zst" "post archives without --archive"
+run pre -n
+assert_has ".tar.zst" "pre archives without --archive"
 
-for args in "post -n --no-archive" "--no-archive post -n"; do
+run post -n
+assert_rc 0 "post dry run succeeds"
+case "$OUT" in
+    *.tar.zst*) bad "post leaves the uploads alone" ;;
+    *)          ok  "post leaves the uploads alone" ;;
+esac
+
+for args in "pre -n --no-archive" "--no-archive pre -n"; do
     # shellcheck disable=SC2086  # deliberate word splitting: these are argv
     run $args
     # The exit status matters here: without it a run that died on "unknown
     # option: --no-archive" would pass this by printing no archive at all.
     assert_rc 0 "--no-archive is accepted ($args)"
     case "$OUT" in
-        *.tar.zst*) bad "--no-archive turns post's archive back off ($args)" ;;
-        *)          ok  "--no-archive turns post's archive back off ($args)" ;;
+        *.tar.zst*) bad "--no-archive turns pre's archive back off ($args)" ;;
+        *)          ok  "--no-archive turns pre's archive back off ($args)" ;;
     esac
 done
 
@@ -765,57 +773,63 @@ group "retention"
 
 rm -f "$DEST"/*.sql.gz
 for s in 2020-01-01 2020-01-02 2020-01-03 2020-01-04; do
-    : > "$DEST/$SITE-db-$s-000000.sql.gz"
+    : > "$DEST/$SITE-$s-000000-database.sql.gz"
 done
 
 # decoys: matching names in the wrong place, plus a directory and a foreign name
-mkdir -p "$BACKUPS/manual" "$BACKUPS/keep/deep" "$DEST/$SITE-db-2019-01-04-000000.sql.gz"
-: > "$BACKUPS/manual/$SITE-db-2019-01-01-000000.sql.gz"
-: > "$BACKUPS/keep/deep/$SITE-db-2019-01-02-000000.sql.gz"
-: > "$BACKUPS/$SITE-db-2019-01-03-000000.sql.gz"
+mkdir -p "$BACKUPS/manual" "$BACKUPS/keep/deep" "$DEST/$SITE-2019-01-04-000000-database.sql.gz"
+: > "$BACKUPS/manual/$SITE-2019-01-01-000000-database.sql.gz"
+: > "$BACKUPS/keep/deep/$SITE-2019-01-02-000000-database.sql.gz"
+: > "$BACKUPS/$SITE-2019-01-03-000000-database.sql.gz"
 : > "$DEST/notes.txt"
 : > "$DEST/manual-export.sql.gz"
+# right shape, right place, no stamp: retention has nothing to order it by, so
+# a pattern loose enough to pick it up would sort it above every real snapshot
+: > "$DEST/$SITE-hand-made-database.sql.gz"
 
 KEEP=2 run db
 assert_rc 0 "run with KEEP=2 succeeds"
 assert_eq "$(managed)" "2" "trims managed snapshots to KEEP"
-assert_file "$BACKUPS/manual/$SITE-db-2019-01-01-000000.sql.gz"    "spares a manual/ subfolder"
-assert_file "$BACKUPS/keep/deep/$SITE-db-2019-01-02-000000.sql.gz" "spares a nested folder"
-assert_file "$BACKUPS/$SITE-db-2019-01-03-000000.sql.gz"           "spares the backup root"
-assert_file "$DEST/notes.txt"                                      "spares unrelated files"
-assert_file "$DEST/manual-export.sql.gz"                           "spares foreign names"
-assert_dir  "$DEST/$SITE-db-2019-01-04-000000.sql.gz"              "spares matching directories"
+assert_file "$BACKUPS/manual/$SITE-2019-01-01-000000-database.sql.gz"    "spares a manual/ subfolder"
+assert_file "$BACKUPS/keep/deep/$SITE-2019-01-02-000000-database.sql.gz" "spares a nested folder"
+assert_file "$BACKUPS/$SITE-2019-01-03-000000-database.sql.gz"           "spares the backup root"
+assert_file "$DEST/notes.txt"                                           "spares unrelated files"
+assert_file "$DEST/manual-export.sql.gz"                                "spares foreign names"
+assert_file "$DEST/$SITE-hand-made-database.sql.gz"                     "spares a name of its shape with no stamp"
+assert_dir  "$DEST/$SITE-2019-01-04-000000-database.sql.gz"             "spares matching directories"
 
-# The label sits in front of the date, so sorting on the whole name would rank
-# every pre-update snapshot above every unlabelled one and trim the newest
-# backups to keep years-old ones. Age comes from the stamp on the end.
+# Order comes from the stamp, which leads every name; the -pre-update tail that
+# follows it must not get a vote, or every labelled snapshot would outrank every
+# plain one and the newest backups would go first.
 find "$DEST" -maxdepth 1 -type f -name '*.sql.gz' -exec rm -f {} +
-: > "$DEST/$SITE-db-pre-update-2020-01-01-000000.sql.gz"
-: > "$DEST/$SITE-db-post-update-2020-01-02-000000.sql.gz"
-: > "$DEST/$SITE-db-2021-01-01-000000.sql.gz"
+: > "$DEST/$SITE-2020-01-01-000000-database-pre-update.sql.gz"
+: > "$DEST/$SITE-2020-01-02-000000-database-post-update.sql.gz"
+: > "$DEST/$SITE-2021-01-01-000000-database.sql.gz"
 KEEP=2 run db
 assert_eq "$(managed)" "2" "trims a mix of labelled and unlabelled to KEEP"
-assert_file "$DEST/$SITE-db-2021-01-01-000000.sql.gz" \
+assert_file "$DEST/$SITE-2021-01-01-000000-database.sql.gz" \
             "keeps the newest snapshot whatever it is labelled"
-assert_gone "$DEST/$SITE-db-pre-update-2020-01-01-000000.sql.gz" \
+assert_gone "$DEST/$SITE-2020-01-01-000000-database-pre-update.sql.gz" \
             "...and drops the oldest, label or no label"
 
-# Names written before the rename carry no readable stamp. They must still be
-# reachable by retention, and they are the oldest thing here.
+# A name from before this scheme has no stamp where retention looks for one, so
+# it cannot be ranked against one that has — it must be left alone rather than
+# guessed at.
 find "$DEST" -maxdepth 1 -type f -name '*.sql.gz' -exec rm -f {} +
 : > "$DEST/$SITE-db-20200101-000000-pre.sql.gz"
-: > "$DEST/$SITE-db-2021-01-01-000000.sql.gz"
-KEEP=2 run db
-assert_gone "$DEST/$SITE-db-20200101-000000-pre.sql.gz" "trims an old-style name first"
-assert_file "$DEST/$SITE-db-2021-01-01-000000.sql.gz"   "...before anything newer"
+: > "$DEST/$SITE-2021-01-01-000000-database.sql.gz"
+KEEP=1 run db
+assert_file "$DEST/$SITE-db-20200101-000000-pre.sql.gz" "spares a name from before the rename"
+assert_gone "$DEST/$SITE-2021-01-01-000000-database.sql.gz" \
+            "...while still trimming the names it did write"
 
 # --no-prune must leave even the oldest alone
 for s in 2020-01-01 2020-01-02 2020-01-03 2020-01-04; do
-    : > "$DEST/$SITE-db-$s-000000.sql.gz"
+    : > "$DEST/$SITE-$s-000000-database.sql.gz"
 done
 KEEP=2 run db --no-prune
 assert_rc 0 "--no-prune succeeds"
-assert_file "$DEST/$SITE-db-2020-01-01-000000.sql.gz" "--no-prune spares the oldest"
+assert_file "$DEST/$SITE-2020-01-01-000000-database.sql.gz" "--no-prune spares the oldest"
 
 # ── what it refuses ─────────────────────────────────────────────────────────
 # Discovery believes what the server tells it, and the uploads path it hears
@@ -929,9 +943,9 @@ group "what the dump is readable by"
 # default umask would hand it to anyone else with an account on this machine,
 # and the .part it is assembled in has an entirely predictable name.
 run db
-# unlabelled names only: `db` writes one of those, and a `pre-update-` name
-# would sort above every one of them.
-LAST_GZ="$(find "$DEST" -maxdepth 1 -type f -name "$SITE-db-[0-9]*.sql.gz" | sort | tail -1)"
+# unlabelled names only: `db` writes one of those, and a -pre-update sharing its
+# stamp would sort above it.
+LAST_GZ="$(find "$DEST" -maxdepth 1 -type f -name "$SITE-*-database.sql.gz" | sort | tail -1)"
 assert_eq "$(modestr "$LAST_GZ")" "-rw-------" "the compressed dump is readable only by its owner"
 assert_eq "$(modestr "$SQL_DIR/$(basename "$LAST_GZ" .sql.gz).sql")" "-rw-------" \
           "...and so is the plain .sql beside the project"

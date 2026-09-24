@@ -56,9 +56,9 @@ Skip the question with `backup-wp --host example-prod`.
 backup-wp                      # DB + uploads mirror (the default)
 backup-wp --archive            # DB + uploads mirror + .tar.zst archive of uploads
 
-backup-wp pre                  # DB only, tagged "pre-update"
-backup-wp post                 # DB + uploads mirror + .tar.zst, tagged "post-update"
-backup-wp post --no-archive    # ...without the .tar.zst
+backup-wp pre                  # DB + uploads mirror + .tar.zst, tagged "pre-update"
+backup-wp pre --no-archive     # ...without the .tar.zst
+backup-wp post                 # DB only, tagged "post-update"
 
 backup-wp db                   # DB only
 
@@ -75,7 +75,7 @@ TIP: The site comes from the directory you're in. To work from anywhere add the 
 | Flag             | Effect                                                  |
 | ---------------- | ------------------------------------------------------- |
 | `-a, --archive`  | also build a dated `.tar.zst` of the uploads            |
-| `--no-archive`   | skip that archive where it is the default (`post`)      |
+| `--no-archive`   | skip that archive where it is the default (`pre`)       |
 | `-n, --dry-run`  | show what would happen; transfer nothing                |
 | `-f, --force`    | skip the first-run confirmation before `rsync --delete` |
 | `--no-prune`     | keep every old snapshot instead of trimming             |
@@ -92,11 +92,11 @@ TIP: The site comes from the directory you're in. To work from anywhere add the 
 
 ```text
 ~/Site Backups/<year>/<month>/<site>/
-    <site>-db-pre-update-2026-01-30-091200.sql.gz
-    <site>-db-post-update-2026-01-30-104300.sql.gz
-    <site>-db-2026-01-30-131500.sql.gz        <- from `db` or `all`
-    <site>-uploads-2026-01-30-104300.tar.zst
-    rescued-2026-01-30-104300/                <- anything the mirror replaced
+    <site>-2026-01-30-091200-database-pre-update.sql.gz
+    <site>-2026-01-30-091200-uploads.tar.zst
+    <site>-2026-01-30-104300-database-post-update.sql.gz
+    <site>-2026-01-30-131500-database.sql.gz   <- from `db` or `all`
+    rescued-2026-01-30-104300/                 <- anything the mirror replaced
 
 ~/Sites/<site>/public_html/uploads/     <- mirror of production
 ~/Sites/<site>/sql/latest.sql           <- newest dump, uncompressed
@@ -119,10 +119,10 @@ comes from `wp_upload_dir()`.
   Symlinks arriving from the server that point out of the uploads tree are
   dropped rather than recreated locally.
 - **Retention is narrow.** Old snapshots trim to the newest `$KEEP` (default
-  10), but only files sitting exactly at
-  `<root>/<year>/<month>/<site>/<site>-db-*.sql.gz` (or `-uploads-*.tar.zst`).
-  Anything filed elsewhere under the backup root is never touched.
-  `--no-prune` skips trimming.
+  10), but only files carrying the dated name above and sitting exactly at
+  `<root>/<year>/<month>/<site>/`. Anything filed elsewhere under the backup
+  root, or named any other way — including backups from before this naming —
+  is never touched. `--no-prune` skips trimming.
 - **Nothing on the server is touched** by any backup command. The one exception
   is `plugins --update`.
 

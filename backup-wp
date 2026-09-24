@@ -2,9 +2,9 @@
 #
 # backup-wp — pull a WordPress site's database and uploads down from production.
 #
-#   backup-wp pre                  # DB snapshot, before you deploy
-#   backup-wp post                 # DB + uploads + a dated tar.zst of them
-#   backup-wp post --no-archive    # ...without the tar.zst
+#   backup-wp pre                  # DB + uploads + a dated tar.zst, before you deploy
+#   backup-wp pre --no-archive     # ...without the tar.zst
+#   backup-wp post                 # DB snapshot, after the deploy
 #   backup-wp example-site db      # any site, from anywhere, by key
 #
 # Run it from inside a site's project directory and it works out which site you
@@ -140,9 +140,9 @@ usage() {
 usage: backup-wp [<site>] [<what>] [options]
 
 what
-  pre        database only, tagged "pre-update"   (run before `git deploy`)
-  post       database tagged "post-update" + uploads (run after the deploy)
+  pre        database tagged "pre-update" + uploads (run before `git deploy`)
              implies --archive; --no-archive turns it back off
+  post       database only, tagged "post-update"  (run after the deploy)
   db         database only, untagged
   uploads    uploads mirror only
   all        database + uploads                 (the default)
@@ -172,9 +172,10 @@ Plugins held with --hold are never updated. They are listed as "held" when an
 update is pending, and --update passes over them. The list lives in HOLD_PLUGINS
 in the site's config, editable by hand and kept across --setup.
 
-Retention only ever considers files sitting exactly at
-<root>/<year>/<month>/<site>/<site>-db-*.sql.gz (or -uploads-*.tar.zst).
-Anything you file anywhere else under the backup root is never touched.
+Backups are named <site>-<year>-<month>-<day>-<time>-database[-pre-update] and
+<site>-<year>-<month>-<day>-<time>-uploads. Retention only ever considers files
+with that name sitting exactly at <root>/<year>/<month>/<site>/. Anything you
+file anywhere else under the backup root, or name any other way, is untouched.
 
 The uploads mirror is exact, so it removes local files production does not
 have. They are moved to <...>/<site>/rescued-<stamp>/ first, not deleted.
@@ -182,7 +183,7 @@ EOF
 }
 
 # ── argument parsing ────────────────────────────────────────────────────────
-# ARCHIVE starts empty rather than 0 so `post` can default it to 1 below
+# ARCHIVE starts empty rather than 0 so `pre` can default it to 1 below
 # without overriding an explicit --no-archive, whichever order they were given.
 SITE=""; WHAT=""; ARCHIVE=""; DRY=0; FORCE=0; PRUNE=1; SETUP=0; HOST_ARG=""
 RESCUE_ON=1; APPLY=0; ONLY=""; HOLD_ADD=""; HOLD_DEL=""
@@ -251,10 +252,10 @@ fi
 WHAT="${WHAT:-all}"
 DO_PLUGINS=0
 case "$WHAT" in
-    pre)     DO_DB=1; DO_UP=0; LABEL="pre-update"  ;;
-    # `post` is the after-the-deploy record of what production held, so it
+    # `pre` is the record to fall back on if the deploy goes wrong, so it
     # keeps the archive as well as the mirror unless told otherwise.
-    post)    DO_DB=1; DO_UP=1; LABEL="post-update"; ARCHIVE="${ARCHIVE:-1}" ;;
+    pre)     DO_DB=1; DO_UP=1; LABEL="pre-update"; ARCHIVE="${ARCHIVE:-1}" ;;
+    post)    DO_DB=1; DO_UP=0; LABEL="post-update" ;;
     db)      DO_DB=1; DO_UP=0; LABEL=""     ;;
     uploads) DO_DB=0; DO_UP=1; LABEL=""     ;;
     all)     DO_DB=1; DO_UP=1; LABEL=""     ;;
@@ -563,13 +564,13 @@ LOCAL_SQL="$SITE_DIR/sql"
 
 # ── paths for this run ──────────────────────────────────────────────────────
 SITE_BACKUPS="$DEST_DIR/$SITE"
-# The label sits between the kind and the date so a listing groups by what the
-# snapshot is; the stamp always ends the name, which is where retention reads it
-# back from.
-NAME="$SITE-db${LABEL:+-$LABEL}-$STAMP"
+# The stamp comes before what the file is, so a day's runs sit together in a
+# listing however many there were — and so retention can sort on it. Everything
+# after it only ever describes the same moment.
+NAME="$SITE-$STAMP-database${LABEL:+-$LABEL}"
 DB_GZ="$SITE_BACKUPS/$NAME.sql.gz"
 DB_SQL="$LOCAL_SQL/$NAME.sql"
-UP_TAR="$SITE_BACKUPS/$SITE-uploads-$STAMP.tar.zst"
+UP_TAR="$SITE_BACKUPS/$SITE-$STAMP-uploads.tar.zst"
 MIRRORED="$CONF_DIR/$SITE.mirrored"
 
 trap 'rm -f "$DB_GZ.part" "$DB_SQL.part" "$UP_TAR.part"' EXIT
@@ -956,41 +957,26 @@ EOF
 fi
 
 # ── 4. prune ────────────────────────────────────────────────────────────────
-# Age is read from the stamp the name ends in, never from the name as a whole:
-# `pre-update` and `post-update` sit in front of the date, so a plain reverse
-# sort would rank every pre- above every post- above every unlabelled snapshot
-# and delete this morning's backup while keeping one from last spring. Each
-# path is tagged with its stamp and sorted on that instead.
+# The stamp leads every name and is fixed width, so a reverse sort is
+# newest-first and the `-database-pre-update` tail never gets a say. Move the
+# stamp off the front and this silently starts sorting by label instead — which
+# would delete this morning's backup to keep one from last spring.
 #
-# A name from before this scheme (<site>-db-20200101-000000-pre.sql.gz) tags as
-# zeros and so sorts oldest, which is exactly what it is: every one of them
-# predates the rename.
+# The patterns spell the stamp out digit by digit rather than leaning on a
+# wildcard, so what the sort sees is only ever names this script wrote. A name
+# that carries no stamp cannot be ranked against one that does, so the safe
+# thing is to never pick it up: that includes every backup written before this
+# naming, which retention now leaves alone.
 #
-# The depth bounds are the safety rail: retention is confined to the exact
+# The depth bounds are the other safety rail: retention is confined to the exact
 # level this script writes to, so anything filed elsewhere under the backup
 # root — a manual export, a keep/ folder, an old dump — is invisible to it
 # even when the name matches.
-newest_first() {
-    local ext="$1" f base key
-    while IFS= read -r f; do
-        base="${f##*/}"
-        key="${base%"$ext"}"
-        key="${key: -17}"
-        case "$key" in
-            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
-            *) key="00000000000000000" ;;
-        esac
-        printf '%s\t%s\n' "$key" "$f"
-    done | LC_ALL=C sort -r | cut -c19-
-}
-
 prune() {
     local dir="$1" pattern="$2" keep="$3" mind="$4" maxd="$5"
     [ -d "$dir" ] || return 0
-    # Every pattern here is <prefix>*<extension>, so what follows the wildcard
-    # is the suffix to strip before reading the stamp off the end.
     find "$dir" -mindepth "$mind" -maxdepth "$maxd" -type f -name "$pattern" \
-        2>/dev/null | newest_first "${pattern##*\*}" | tail -n "+$((keep + 1))" |
+        2>/dev/null | sort -r | tail -n "+$((keep + 1))" |
         while IFS= read -r old; do
             if [ "$DRY" -eq 1 ]; then
                 info "would prune $(basename "$old")"
@@ -1002,13 +988,16 @@ prune() {
 }
 
 if [ "$PRUNE" -eq 1 ]; then
+    # The same stamp the names are built from, as a glob: <year>-<month>-<day>-
+    # <time>. The trailing `*` after it is the optional -pre-update/-post-update.
+    DATED='[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
     # 4 == <root>/<year>/<month>/<site>/<file>; 1 == straight inside sql/
     if [ "$DO_DB" -eq 1 ]; then
-        prune "$BACKUP_ROOT" "$SITE-db-*.sql.gz" "$KEEP"     4 4
-        prune "$LOCAL_SQL"   "$SITE-db-*.sql"    "$KEEP_SQL" 1 1
+        prune "$BACKUP_ROOT" "$SITE-$DATED-database*.sql.gz" "$KEEP"     4 4
+        prune "$LOCAL_SQL"   "$SITE-$DATED-database*.sql"    "$KEEP_SQL" 1 1
     fi
     if [ "$ARCHIVE" -eq 1 ]; then
-        prune "$BACKUP_ROOT" "$SITE-uploads-*.tar.zst" "$KEEP" 4 4
+        prune "$BACKUP_ROOT" "$SITE-$DATED-uploads.tar.zst" "$KEEP" 4 4
     fi
 fi
 
